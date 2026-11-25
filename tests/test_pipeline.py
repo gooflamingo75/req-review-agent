@@ -1,0 +1,127 @@
+"""Тесты без ключа: имитация ответов модели (ScriptedLLM) и демо-режим.
+
+Запуск:  python -m pytest -q   (или  python tests/test_pipeline.py)
+"""
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from reqreview.agent import run  # noqa: E402
+from reqreview.llm import MockLLM, parse_json  # noqa: E402
+from reqreview.loader import load_document  # noqa: E402
+from reqreview.report import render  # noqa: E402
+
+SAMPLE = ROOT / "examples" / "sample_requirements.md"
+
+
+class ScriptedLLM:
+    """Имитирует ответы Gemini: в т. ч. неточную цитату и выдуманную цитату."""
+    name = "scripted"
+    model = "scripted"
+
+    def __init__(self):
+        self.calls = 0
+
+    def generate_json(self, task, system, prompt, payload=None):
+        self.calls += 1
+        if task == "extract":
+            # нормальные строки + одна неточная цитата (ё/кавычки/регистр) + одна выдуманная
+            text = "\n".join(t for _, t in payload["lines"])
+            out = []
+            for gid, t in payload["lines"]:
+                if "**КБ-" in t or "**НФ-" in t:
+                    doc_id = t.split("**")[1].rstrip(".")
+                    body = t.split("**", 2)[2].strip()
+                    out.append({"doc_id": doc_id, "text": body, "line_start": gid, "line_end": gid,
+                                "summary": body[:50], "kind": "функциональное"})
+                elif t.startswith("| Карта активна"):
+                    out.append({"doc_id": None, "text": t, "line_start": gid, "line_end": gid,
+                                "summary": "Приёмка: 2% от 10 000", "kind": "прочее"})
+            out[0]["text"] = out[0]["text"].upper()  # регистр не важен
+            out.append({"doc_id": "X-99", "text": "Система должна летать в космос", "line_start": 9999,
+                        "line_end": 9999, "summary": "выдумка", "kind": "прочее"})
+            assert "КБ-1" in text
+            return json.dumps({"requirements": out}) and {"requirements": out}
+        if task == "review":
+            res = []
+            for r in payload["requirements"]:
+                f = []
+                if r["doc_id"] == "КБ-2":
+                    f.append({"criterion": "VER", "severity": "critical", "quote": "начисляется  БЫСТРО",
+                              "problem": "Нет срока начисления.", "recommendation": "Указать срок, напр. 1 час."})
+                if r["doc_id"] == "КБ-7":
+                    f.append({"criterion": "UNA", "severity": "major", "quote": "цитата, которой нет",
+                              "problem": "Субъективные оценки.", "recommendation": "Задать критерии."})
+                res.append({"id": r["id"], "criteria": {"NEC": "ok", "VER": "fail" if f else "ok"}, "findings": f})
+            return {"results": res}
+        if task == "set":
+            ids = {r["doc_id"]: r["id"] for r in payload["requirements"]}
+            return {"findings": [
+                {"type": "Противоречие", "criterion": "S-CONS", "severity": "critical",
+                 "requirement_ids": [ids["КБ-3"], ids["КБ-6"]],
+                 "quotes": ["Максимальная сумма кэшбэка в месяц — 5 000 ₸", "составляет 3 000 ₸"],
+                 "problem": "Разные лимиты.", "recommendation": "Оставить один."},
+                {"type": "Пропуск", "criterion": "S-COMPL", "severity": "major", "requirement_ids": [],
+                 "quotes": ["этого текста нет в документе"], "problem": "Выдумка", "recommendation": "-"},
+            ], "set_criteria": {"S-CONS": {"status": "ok", "comment": ""}}}
+        raise AssertionError(task)
+
+
+def test_loader_and_find():
+    doc = load_document(SAMPLE)
+    assert doc.title.startswith("Кэшбэк")
+    hit = doc.find("кэшбэк начисляется   «быстро»".replace("«", "").replace("»", ""))
+    assert hit and "быстро" in hit[0]
+    assert doc.find("совсем другой текст") is None
+
+
+def test_scripted_pipeline():
+    doc = load_document(SAMPLE)
+    res = run(doc, ScriptedLLM(), batch_size=4)
+    ids = [r.doc_id for r in res.requirements]
+    assert "X-99" not in ids, "выдуманное требование должно быть отброшено"
+    assert "КБ-1" in ids and "НФ-2" in ids and None in ids
+    r1 = next(r for r in res.requirements if r.doc_id == "КБ-1")
+    assert r1.text.startswith("Клиент с активной"), "цитата восстановлена дословно из документа"
+    r2 = next(r for r in res.requirements if r.doc_id == "КБ-2")
+    f = next(f for f in r2.findings if f.criterion == "VER")
+    assert f.verified and f.quote == "начисляется быстро"
+    r7 = next(r for r in res.requirements if r.doc_id == "КБ-7")
+    bad = next(f for f in r7.findings if f.source == "LLM")
+    assert not bad.verified and bad.quote == r7.text
+    assert any(f.source == "правило" for f in r7.findings), "правила дополняют модель"
+    types = [f.type for f in res.set_findings]
+    assert "Противоречие" in types
+    assert not any(f.problem == "Выдумка" for f in res.set_findings), "непроверяемое замечание отброшено"
+    assert any(f.type == "Пропуск" and "КБ-5" in f.problem for f in res.set_findings), "пропуск в нумерации"
+    assert res.set_criteria["S-CONS"]["status"] == "fail"
+    md = render(res, "test", "examples/sample_requirements.md")
+    for section in ("Паспорт прогона", "Как агент выделил требования", "Проверка каждого требования",
+                    "Проверка набора требований", "Сводка", "Итог"):
+        assert section in md
+    assert "Нет, начинать разработку" in md
+    assert "строка" in md
+
+
+def test_mock_mode():
+    doc = load_document(SAMPLE)
+    res = run(doc, MockLLM())
+    assert len(res.requirements) >= 10
+    assert res.stats["by_severity"]["critical"] >= 1  # TBD в КБ-9
+
+
+def test_parse_json():
+    assert parse_json('```json\n{"a": 1}\n```') == {"a": 1}
+    assert parse_json('Вот ответ: {"a": [1]} спасибо') == {"a": [1]}
+
+
+if __name__ == "__main__":
+    for name, fn in list(globals().items()):
+        if name.startswith("test_"):
+            fn()
+            print("OK", name)
