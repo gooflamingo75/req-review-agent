@@ -114,8 +114,16 @@ def render(res: Result, agent_version: str, input_display: str) -> str:
         w(f"*Место:* {d.location(r.g1, r.g2)}  ")
         w(f"*Тип:* {r.kind}  ")
         w(f"*Цитата:* «{r.text}»\n")
+        set_only = [c for c in INDIVIDUAL if r.criteria.get(c) == "fail" and not any(f.criterion == c for f in r.findings)]
+        if set_only:
+            refs = [f.fid for f in res.set_findings if r.id in f.req_ids]
+            w(f"- Нарушен критерий {', '.join(set_only)} — общий дефект оформления, описан в замечании к набору"
+              + (f" {', '.join(refs)}" if refs else " (раздел 5.2)") + ".")
         if not r.findings:
-            w("Нарушений не выявлено.\n" if r.reviewed else "⚠️ Модель не вернула результат; нарушений по правилам не выявлено.\n")
+            if not set_only:
+                w("Нарушений не выявлено.\n" if r.reviewed else "⚠️ Модель не вернула результат; нарушений по правилам не выявлено.\n")
+            else:
+                w("")
             continue
         for f in r.findings:
             name = INDIVIDUAL[f.criterion][0]

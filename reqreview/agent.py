@@ -265,6 +265,22 @@ def review_set(doc: Document, reqs: list[Requirement], llm, warnings: list[str])
         warnings.append(f"{dropped} замечание(й) к набору отброшено: модель не привела ни подтверждаемой цитаты, "
                         "ни ссылки на требование.")
 
+    # если модель отметила «соответствие форме» почти у всех требований — это свойство документа, а не
+    # отдельных требований: сворачиваем в одно замечание к набору, чтобы не засорять отчёт
+    cnf_reqs = [r for r in reqs if any(f.criterion == "CNF" and f.severity == "minor" for f in r.findings)]
+    if reqs and len(cnf_reqs) >= max(5, 0.6 * len(reqs)):
+        sample = next(f for f in cnf_reqs[0].findings if f.criterion == "CNF")
+        for r in cnf_reqs:
+            r.findings = [f for f in r.findings if not (f.criterion == "CNF" and f.severity == "minor")]
+            r.criteria["CNF"] = "fail"
+        findings.append(Finding(
+            criterion="S-COMP", severity="minor", type="Несогласованность",
+            problem=f"У {len(cnf_reqs)} из {len(reqs)} требований формулировка не соответствует шаблону "
+                    f"(пример — {cnf_reqs[0].id}: {sample.problem})",
+            recommendation="Привести требования к единому шаблону «<Субъект> должен <действие> <условие>» "
+                           "с уникальным идентификатором.",
+            req_ids=[r.id for r in cnf_reqs][:15], g1=cnf_reqs[0].g1, g2=cnf_reqs[0].g2, source="правило"))
+
     # правила набора
     rd = [{"id": r.id, "doc_id": r.doc_id, "text": r.text} for r in reqs]
     for h in rules.check_set(rd):
