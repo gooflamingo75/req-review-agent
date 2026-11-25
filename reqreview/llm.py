@@ -38,9 +38,17 @@ def log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
+DEFAULT_GEMINI_FALLBACKS = ["gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite",
+                            "gemini-flash-latest", "gemini-flash-lite-latest"]
+
+
 class GeminiLLM:
+    """Gemini с повторами и автоматическим переключением на резервные модели,
+    если основная перегружена (503), не найдена (404) или исчерпан её дневной лимит."""
+
     def __init__(self, api_key: str, model: str = "gemini-3.8-flash",
-                 min_interval: float = 6.0, max_retries: int = 6, temperature: float = 0.1):
+                 min_interval: float = 6.0, max_retries: int = 6, temperature: float = 0.1,
+                 fallbacks: list[str] | None = None):
         try:
             from google import genai
             from google.genai import types
@@ -50,19 +58,41 @@ class GeminiLLM:
             raise LLMError("Не задан GEMINI_API_KEY. Скопируйте .env.example в .env и вставьте ключ.")
         self._types = types
         self.client = genai.Client(api_key=api_key)
-        self.model = model
-        self.name = f"Google Gemini · {model}"
+        chain = [model] + list(DEFAULT_GEMINI_FALLBACKS if fallbacks is None else fallbacks)
+        self.models = list(dict.fromkeys(m.strip() for m in chain if m and m.strip()))
+        self._idx = 0
         self.min_interval = min_interval
         self.max_retries = max_retries
         self.temperature = temperature
         self._last = 0.0
         self.calls = 0
+        self.used: dict[str, int] = {}
+
+    @property
+    def model(self) -> str:
+        return self.models[min(self._idx, len(self.models) - 1)]
+
+    @property
+    def name(self) -> str:
+        if not self.used:
+            return f"Google Gemini · {self.models[0]}"
+        if len(self.used) == 1:
+            return f"Google Gemini · {next(iter(self.used))}"
+        return "Google Gemini · " + ", ".join(f"{m} ({n} запр.)" for m, n in self.used.items())
 
     def _wait_turn(self):
         dt = time.monotonic() - self._last
         if dt < self.min_interval:
             time.sleep(self.min_interval - dt)
         self._last = time.monotonic()
+
+    def _switch(self, reason: str) -> bool:
+        if self._idx + 1 >= len(self.models):
+            return False
+        old = self.model
+        self._idx += 1
+        log(f"   ! модель {old} {reason} — переключаюсь на резервную {self.model}")
+        return True
 
     def _raw(self, system: str, prompt: str) -> str:
         types = self._types
@@ -71,8 +101,9 @@ class GeminiLLM:
             temperature=self.temperature,
             response_mime_type="application/json",
         )
-        delay = 10.0
-        for attempt in range(1, self.max_retries + 1):
+        delay, attempt, overloaded, last_err = 10.0, 0, 0, ""
+        while attempt < self.max_retries * 2:
+            attempt += 1
             self._wait_turn()
             try:
                 resp = self.client.models.generate_content(model=self.model, contents=prompt, config=cfg)
@@ -80,28 +111,41 @@ class GeminiLLM:
                 text = resp.text
                 if not text:
                     raise LLMError("пустой ответ модели")
+                self.used[self.model] = self.used.get(self.model, 0) + 1
                 return text
             except Exception as e:  # noqa: BLE001
                 code = getattr(e, "code", None) or getattr(e, "status_code", None)
                 msg = str(e)
-                if code in (400, 401, 403) or "API_KEY_INVALID" in msg or "PERMISSION_DENIED" in msg:
-                    raise LLMError(f"Ключ отклонён или модель недоступна ({code}): {msg[:300]}") from e
-                if code == 404:
-                    raise LLMError(f"Модель «{self.model}» не найдена. Проверьте GEMINI_MODEL в .env. {msg[:200]}") from e
-                if attempt == self.max_retries:
-                    raise LLMError(f"Не удалось получить ответ после {attempt} попыток: {msg[:300]}") from e
+                last_err = f"{code}: {msg[:300]}"
+                if code in (401, 403) or "API_KEY_INVALID" in msg or "PERMISSION_DENIED" in msg:
+                    raise LLMError(f"Ключ отклонён ({code}). Проверьте GEMINI_API_KEY в .env. {msg[:300]}") from e
+                if code == 404 or (code == 400 and "model" in msg.lower() and "not" in msg.lower()):
+                    if self._switch("недоступна (404)"):
+                        overloaded = 0
+                        continue
+                    raise LLMError(f"Ни одна из моделей {', '.join(self.models)} не доступна. {msg[:200]}") from e
+                if code == 400:
+                    raise LLMError(f"Запрос отклонён (400): {msg[:300]}") from e
+                if code == 429 and "PerDay" in msg:
+                    if self._switch("исчерпала дневной лимит бесплатного тарифа"):
+                        overloaded = 0
+                        continue
+                    raise LLMError("Исчерпан дневной лимит бесплатного тарифа Gemini на всех моделях. "
+                                   "Попробуйте позже.") from e
+                if code in (500, 502, 503, 504) or isinstance(e, LLMError):
+                    overloaded += 1
+                    if overloaded >= 2 and self._switch(f"перегружена ({code})"):
+                        overloaded = 0
+                        delay = 10.0
+                        continue
                 wait = delay
                 m = re.search(r"retry(?:Delay)?['\"]?\s*[:=]?\s*['\"]?(\d+(?:\.\d+)?)s", msg, re.I)
                 if m:
                     wait = max(wait, float(m.group(1)) + 1)
-                if code == 429 and "PerDay" in msg:
-                    raise LLMError("Исчерпан дневной лимит бесплатного тарифа Gemini. "
-                                   "Попробуйте завтра или укажите другую модель в GEMINI_MODEL.") from e
-                log(f"   ! ошибка API ({code or type(e).__name__}), попытка {attempt}/{self.max_retries}, "
-                    f"жду {wait:.0f} с…")
+                log(f"   ! ошибка API ({code or type(e).__name__}) у {self.model}, попытка {attempt}, жду {wait:.0f} с…")
                 time.sleep(wait)
-                delay = min(delay * 2, 90)
-        raise LLMError("unreachable")
+                delay = min(delay * 2, 60)
+        raise LLMError(f"Не удалось получить ответ после {attempt} попыток: {last_err}")
 
     def generate_json(self, task: str, system: str, prompt: str, payload: Any = None) -> Any:
         text = self._raw(system, prompt)

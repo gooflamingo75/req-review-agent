@@ -81,6 +81,7 @@ def main(argv=None) -> int:
                 model=a.model or os.getenv("GEMINI_MODEL") or "gemini-3.8-flash",
                 min_interval=float(os.getenv("REQUEST_INTERVAL_SEC", "6")),
                 max_retries=int(os.getenv("MAX_RETRIES", "6")),
+                fallbacks=[m for m in os.getenv("GEMINI_FALLBACK_MODELS", "").split(",") if m.strip()] or None,
             )
         print(f"Модель: {llm.name}", file=sys.stderr)
         batch = a.batch_size or int(os.getenv("BATCH_SIZE", "8"))
