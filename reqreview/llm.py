@@ -39,7 +39,7 @@ def log(msg: str) -> None:
 
 
 class GeminiLLM:
-    def __init__(self, api_key: str, model: str = "gemini-2.5-flash",
+    def __init__(self, api_key: str, model: str = "gemini-3.8-flash",
                  min_interval: float = 6.0, max_retries: int = 6, temperature: float = 0.1):
         try:
             from google import genai

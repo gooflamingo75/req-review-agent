@@ -6,7 +6,7 @@
 
 Решение для кейса [BCC-HUB x MNU FinTech Hackathon](https://github.com/BCC-HUB/ai-requirements-validator-task).
 
-**Модель:** Google Gemini **`gemini-2.5-flash`** (бесплатный тариф Google AI Studio).
+**Модель:** Google Gemini **`gemini-3.8-flash`** (бесплатный тариф Google AI Studio).
 Можно указать другую модель Gemini или подключить OpenAI-совместимый API / локальную Ollama (см. `.env.example`).
 
 ---
@@ -185,7 +185,7 @@ LLM: проверка набора целиком (8 критериев 29148 §
 |---|---|---|
 | `LLM_PROVIDER` | `gemini` | `gemini`, `openai` (любой OpenAI-совместимый API) или `ollama` |
 | `GEMINI_API_KEY` | — | ключ Google AI Studio |
-| `GEMINI_MODEL` | `gemini-2.5-flash` | модель Gemini |
+| `GEMINI_MODEL` | `gemini-3.8-flash` | модель Gemini |
 | `REQUEST_INTERVAL_SEC` | `6` | пауза между запросами (лимиты бесплатного тарифа) |
 | `BATCH_SIZE` | `8` | требований в одном запросе на проверку |
 
@@ -199,7 +199,7 @@ LLM: проверка набора целиком (8 критериев 29148 §
 | `No module named ...` | Выполните `pip install -r requirements.txt`. |
 | `Не задан GEMINI_API_KEY` | Проверьте, что файл называется именно `.env` (не `.env.txt`) и лежит в папке агента. |
 | `Ключ отклонён` | Скопируйте ключ заново из AI Studio, без пробелов и кавычек. |
-| `Модель … не найдена` | Укажите в `.env` другую модель, например `GEMINI_MODEL=gemini-2.5-flash-lite`. |
+| `Модель … не найдена` | Укажите в `.env` другую модель, например другую модель из списка в AI Studio (https://aistudio.google.com). |
 | Ошибка 429 / лимит | Агент сам ждёт и повторяет. Если исчерпан дневной лимит — попробуйте позже или другую модель. |
 
 ## Структура репозитория

@@ -39,7 +39,7 @@ def main(argv=None) -> int:
         description="ИИ-агент статической проверки документа требований (ISO/IEC/IEEE 29148, IEEE 830).")
     p.add_argument("input", help="путь к документу требований (.pdf, .docx, .md, .txt)")
     p.add_argument("output", help="путь к файлу отчёта (.md); рядом будет создан .json")
-    p.add_argument("--model", help="модель Gemini (по умолчанию из .env или gemini-2.5-flash)")
+    p.add_argument("--model", help="модель Gemini (по умолчанию из .env или gemini-3.8-flash)")
     p.add_argument("--batch-size", type=int, default=None, help="сколько требований проверять за один запрос (по умолчанию 8)")
     p.add_argument("--mock", action="store_true", help="демо-режим без ключа и без LLM (только правила) — для проверки установки")
     a = p.parse_args(argv)
@@ -78,7 +78,7 @@ def main(argv=None) -> int:
         else:
             llm = GeminiLLM(
                 api_key=os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY", ""),
-                model=a.model or os.getenv("GEMINI_MODEL") or "gemini-2.5-flash",
+                model=a.model or os.getenv("GEMINI_MODEL") or "gemini-3.8-flash",
                 min_interval=float(os.getenv("REQUEST_INTERVAL_SEC", "6")),
                 max_retries=int(os.getenv("MAX_RETRIES", "6")),
             )
