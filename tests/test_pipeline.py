@@ -57,9 +57,17 @@ class ScriptedLLM:
                 if r["doc_id"] == "КБ-7":
                     f.append({"criterion": "UNA", "severity": "major", "quote": "цитата, которой нет",
                               "problem": "Субъективные оценки.", "recommendation": "Задать критерии."})
-                res.append({"id": r["id"], "criteria": {"NEC": "ok", "VER": "fail" if f else "ok"}, "findings": f})
+                res.append({"id": r["id"], "criteria": {"NEC": {"status": "ok", "comment": ""},
+                                                        "VER": "fail" if f else "ok"}, "findings": f,
+                            "test_ideas": ["10 000 → 200"], "questions": []})
             return {"results": res}
-        if task == "set":
+        if task == "set_completeness":
+            ids = {r["doc_id"]: r["id"] for r in payload["requirements"]}
+            return {"findings": [], "edge_cases": [{"scenario": "Несколько карт", "requirement_ids": [ids["КБ-1"]],
+                                                    "risk": "r", "question": "q?"}],
+                    "traceability": [{"requirement": ids["КБ-1"], "goal": [], "ui": [], "api_data": [],
+                                      "acceptance": [], "gap": "нет критерия приёмки"}]}
+        if task == "set_consistency":
             ids = {r["doc_id"]: r["id"] for r in payload["requirements"]}
             return {"findings": [
                 {"type": "Противоречие", "criterion": "S-CONS", "severity": "critical",
@@ -101,10 +109,12 @@ def test_scripted_pipeline():
     assert any(f.type == "Пропуск" and "КБ-5" in f.problem for f in res.set_findings), "пропуск в нумерации"
     assert res.set_criteria["S-CONS"]["status"] == "fail"
     md = render(res, "test", "examples/sample_requirements.md")
-    for section in ("Паспорт прогона", "Как агент выделил требования", "Проверка каждого требования",
-                    "Проверка набора требований", "Сводка", "Итог"):
+    for section in ("Паспорт прогона", "Нарезка и инвентаризация требований", "Детальная проверка каждого требования",
+                    "Проверка набора требований в целом", "Сводная статистика", "Итоговый вердикт",
+                    "Матрица прослеживаемости", "EC-01", "Идеи тест-кейсов", "`[CRITICAL]`"):
         assert section in md
-    assert "Нет, начинать разработку" in md
+    assert "РАЗРАБОТКУ НАЧИНАТЬ НЕ РЕКОМЕНДУЕТСЯ" in md
+    assert res.requirements[0].id == "REQ-01"
     assert "строка" in md
 
 
@@ -118,6 +128,22 @@ def test_mock_mode():
 def test_parse_json():
     assert parse_json('```json\n{"a": 1}\n```') == {"a": 1}
     assert parse_json('Вот ответ: {"a": [1]} спасибо') == {"a": [1]}
+
+
+def test_document_rules_generic(tmp_path=None):
+    """Детерминированные проверки универсальны: другой домен, другие валюты и URL."""
+    import tempfile
+    from reqreview.rules import check_document
+    text = "\n".join([
+        "# Перевод между счетами", "## Данные", "Сумма хранится в копейках.",
+        "## API", "| Method | GET |", "| URL | /accounts/updateLimit |", "Лимит задаётся в рублях.",
+        "#### 200. Успешно", "```json", '{"result":"ERROR"}', "```",
+        "## Тесты", "Сценарии будут определены позже.",
+    ])
+    with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8") as f:
+        f.write(text)
+    tags = {h["tag"] for h in check_document(load_document(f.name))}
+    assert {"UNITS", "REST-METHOD", "STATUS-200", "SECTION-EMPTY"} <= tags, tags
 
 
 if __name__ == "__main__":

@@ -39,16 +39,22 @@ class Document:
     _starts: list[int] = field(default_factory=list, repr=False)
     _owners: list[int] = field(default_factory=list, repr=False)
     _section: dict[int, str] = field(default_factory=dict, repr=False)
+    _part: dict[int, str] = field(default_factory=dict, repr=False)
 
     # ---------- построение индексов ----------
     def build(self) -> "Document":
         buf, starts, owners = [], [], []
         pos = 0
-        section = ""
+        section, part = "", ""
+        part_re = re.compile(r"^\s*#{0,3}\s*((Часть|Part|Документ|Приложение)\s+[\wА-Яа-я№-]+)", re.I)
         for ln in self.lines:
             if ln.is_heading:
                 section = collapse_ws(ln.text.lstrip("#").strip())[:90]
+                m = part_re.match(ln.text)
+                if m:
+                    part = m.group(1).rstrip(".")
             self._section[ln.gid] = section
+            self._part[ln.gid] = part
             t = collapse_ws(ln.text)
             if not t:
                 continue
@@ -168,6 +174,9 @@ class Document:
 
     def section_of(self, gid: int) -> str:
         return self._section.get(gid, "")
+
+    def part_of(self, gid: int) -> str:
+        return self._part.get(gid, "")
 
     def headings_outline(self) -> str:
         return "\n".join(f"[L{ln.gid}] {collapse_ws(ln.text)}" for ln in self.lines if ln.is_heading)

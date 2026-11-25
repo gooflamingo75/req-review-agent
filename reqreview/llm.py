@@ -257,12 +257,12 @@ class MockLLM:
             res = []
             for r in payload["requirements"]:
                 hits = rules.check_requirement(r["text"])
-                crit = {c: "na" for c in ("NEC", "APP", "UNA", "COM", "SIN", "FEA", "VER", "COR", "CNF")}
+                crit = {c: "na" for c in ("COM", "UNA", "CON", "VER", "FEA", "NEC", "APP", "SIN", "COR", "CNF")}
                 for h in hits:
                     crit[h["criterion"]] = "fail"
                 res.append({"id": r["id"], "criteria": crit, "findings": [
                     {k: h[k] for k in ("criterion", "severity", "quote", "problem", "recommendation")} for h in hits]})
             return {"results": res}
-        if task == "set":
+        if task.startswith("set"):
             return {"findings": [], "set_criteria": {}}
         raise LLMError(f"MockLLM: неизвестная задача {task}")

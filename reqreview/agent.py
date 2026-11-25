@@ -1,6 +1,10 @@
-"""Конвейер проверки: извлечение требований → проверка каждого → проверка набора."""
+"""Конвейер проверки:
+1) выделение требований → 2) проверка каждого → 3) проверка набора (две части: непротиворечивость/стандарты
+и полнота/пограничные сценарии/прослеживаемость) + детерминированные правила → 4) верификация цитат.
+"""
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 
@@ -11,8 +15,14 @@ from .loader import Document
 from .util import collapse_ws, norm, short
 
 EXTRACT_CHUNK_CHARS = 18000
-FULL_CONTEXT_CHARS = 40000      # до такого размера документ целиком передаётся как контекст при проверке требований
+FULL_CONTEXT_CHARS = 60000      # до такого размера документ целиком передаётся как контекст при проверке требований
 SET_FULL_DOC_CHARS = 180000     # до такого размера документ целиком передаётся при проверке набора
+
+RULE_TAGS = {"UNA": "AMBIGUITY", "COM": "PLACEHOLDER", "APP": "DESIGN-DETAIL", "SIN": "NON-ATOMIC",
+             "FEA": "FEASIBILITY", "VER": "UNTESTABLE", "CNF": "FORMAT"}
+STATUS_RANK = {"na": 0, "ok": 1, "warn": 2, "fail": 3}
+_SEV_ALIASES = {"blocker": "critical", "high": "major", "medium": "major", "low": "minor",
+                "критический": "critical", "существенный": "major", "замечание": "minor"}
 
 
 @dataclass
@@ -28,7 +38,10 @@ class Finding:
     verified: bool = True                   # цитата найдена в документе дословно
     req_ids: list[str] = field(default_factory=list)
     type: str = ""
+    tag: str = ""
     fid: str = ""
+    locs: list[tuple[int, int]] = field(default_factory=list)
+    quotes: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -41,8 +54,12 @@ class Requirement:
     g1: int
     g2: int
     section: str = ""
+    part: str = ""
     criteria: dict[str, str] = field(default_factory=dict)
+    comments: dict[str, str] = field(default_factory=dict)
     findings: list[Finding] = field(default_factory=list)
+    test_ideas: list[str] = field(default_factory=list)
+    questions: list[str] = field(default_factory=list)
     reviewed: bool = False
 
 
@@ -53,6 +70,8 @@ class Result:
     requirements: list[Requirement]
     set_findings: list[Finding]
     set_criteria: dict[str, dict]
+    edge_cases: list[dict]
+    traceability: list[dict]
     stats: dict
     warnings: list[str]
     started: float
@@ -62,7 +81,19 @@ class Result:
 
 def _sev(s) -> str:
     s = str(s or "").lower().strip()
+    s = _SEV_ALIASES.get(s, s)
     return s if s in SEVERITY else "major"
+
+
+def _tag(s) -> str:
+    t = collapse_ws(str(s or "")).upper().replace(" ", "-")
+    return "".join(ch for ch in t if ch.isalnum() or ch in "-_/")[:24]
+
+
+def _strs(v, limit=5) -> list[str]:
+    if isinstance(v, str):
+        v = [v]
+    return [collapse_ws(str(x)) for x in (v or []) if collapse_ws(str(x))][:limit]
 
 
 # ------------------------------------------------------------------ 1. извлечение
@@ -70,7 +101,6 @@ def _chunks(doc: Document) -> list[list]:
     out, cur, size = [], [], 0
     for ln in doc.nonempty():
         t = len(ln.text)
-        # режем по заголовкам, если фрагмент уже большой
         if cur and (size + t > EXTRACT_CHUNK_CHARS or (ln.is_heading and size > EXTRACT_CHUNK_CHARS * 0.6)):
             out.append(cur)
             cur, size = [], 0
@@ -85,7 +115,7 @@ def extract(doc: Document, llm, warnings: list[str]) -> list[Requirement]:
     chunks = _chunks(doc)
     raw = []
     for i, ch in enumerate(chunks, 1):
-        log(f"[1/3] Выделение требований: фрагмент {i}/{len(chunks)}…")
+        log(f"[1/4] Выделение требований: фрагмент {i}/{len(chunks)}…")
         payload = {"lines": [(ln.gid, ln.text) for ln in ch]}
         data = llm.generate_json("extract", prompts.SYSTEM,
                                  prompts.extract_prompt(doc.title, doc.numbered(ch), i, len(chunks)), payload)
@@ -97,8 +127,8 @@ def extract(doc: Document, llm, warnings: list[str]) -> list[Requirement]:
     for it in raw:
         text = collapse_ws(str(it.get("text") or ""))
         try:
-            ls = int(str(it.get("line_start") or 0).lstrip("L"))
-            le = int(str(it.get("line_end") or ls).lstrip("L"))
+            ls = int(str(it.get("line_start") or 0).lstrip("Ll"))
+            le = int(str(it.get("line_end") or ls).lstrip("Ll"))
         except ValueError:
             ls = le = 0
         if le < ls:
@@ -123,12 +153,13 @@ def extract(doc: Document, llm, warnings: list[str]) -> list[Requirement]:
         reqs.append(Requirement(id="", doc_id=doc_id, text=text,
                                 summary=collapse_ws(str(it.get("summary") or "")) or short(text, 80),
                                 kind=collapse_ws(str(it.get("kind") or "")) or "—",
-                                g1=g1, g2=g2, section=doc.section_of(g1)))
+                                g1=g1, g2=g2, section=doc.section_of(g1), part=doc.part_of(g1)))
     if dropped:
         warnings.append(f"{dropped} фрагмент(ов), предложенных моделью как требования, не найдены в документе и отброшены.")
     reqs.sort(key=lambda r: (r.g1, r.g2))
+    width = 2 if len(reqs) < 100 else 3
     for n, r in enumerate(reqs, 1):
-        r.id = f"R-{n:03d}"
+        r.id = f"REQ-{n:0{width}d}"
     return reqs
 
 
@@ -139,9 +170,15 @@ def _anchor(doc: Document, quote: str, req: Requirement) -> tuple[str, int, int,
         f = doc.find(quote, near=(req.g1, req.g2))
         if f and req.g1 - 2 <= f[1] <= req.g2 + 2:
             return f[0], f[1], f[2], True
-        if norm(quote).strip(" .…") and norm(quote).strip(" .…") in norm(req.text):
+        q = norm(quote).strip(" .…")
+        if q and q in norm(req.text):
             return quote, req.g1, req.g2, True
     return req.text, req.g1, req.g2, False
+
+
+def _bump(r: Requirement, c: str, status: str):
+    if STATUS_RANK[status] > STATUS_RANK.get(r.criteria.get(c, "na"), 0):
+        r.criteria[c] = status
 
 
 def review_requirements(doc: Document, reqs: list[Requirement], llm, batch_size: int, warnings: list[str]):
@@ -151,10 +188,12 @@ def review_requirements(doc: Document, reqs: list[Requirement], llm, batch_size:
         context = "Структура документа (заголовки):\n" + doc.headings_outline()
     hints = {r.id: rules.check_requirement(r.text) for r in reqs}
     by_id = {r.id: r for r in reqs}
+    by_num = {re.sub(r"\D", "", r.id).lstrip("0"): r for r in reqs}
     batches = [reqs[i:i + batch_size] for i in range(0, len(reqs), batch_size)]
+    is_mock = llm.model == "mock"
     for bi, batch in enumerate(batches, 1):
-        log(f"[2/3] Проверка требований: пакет {bi}/{len(batches)} ({batch[0].id}…{batch[-1].id})…")
-        payload = [{"id": r.id, "doc_id": r.doc_id, "section": r.section, "text": r.text,
+        log(f"[2/4] Проверка требований: пакет {bi}/{len(batches)} ({batch[0].id}…{batch[-1].id})…")
+        payload = [{"id": r.id, "doc_id": r.doc_id, "section": r.section, "kind": r.kind, "text": r.text,
                     "rule_hints": [f"«{h['trigger']}»: {h['problem']}" for h in hints[r.id] if h["trigger"]]}
                    for r in batch]
         try:
@@ -168,13 +207,23 @@ def review_requirements(doc: Document, reqs: list[Requirement], llm, batch_size:
         for res in results:
             if not isinstance(res, dict):
                 continue
-            r = by_id.get(str(res.get("id", "")).strip())
+            rid = str(res.get("id", "")).strip()
+            r = by_id.get(rid) or by_num.get(re.sub(r"\D", "", rid).lstrip("0"))
             if r is None or r.reviewed:
                 continue
             r.reviewed = True
             crit = res.get("criteria") or {}
-            r.criteria = {c: (str(crit.get(c, "na")).lower() if str(crit.get(c, "na")).lower() in ("ok", "fail", "na") else "na")
-                          for c in INDIVIDUAL}
+            for c in INDIVIDUAL:
+                v = crit.get(c, "na") if isinstance(crit, dict) else "na"
+                if isinstance(v, dict):
+                    st, cm = str(v.get("status", "na")).lower(), collapse_ws(str(v.get("comment") or ""))
+                else:
+                    st, cm = str(v).lower(), ""
+                r.criteria[c] = st if st in STATUS_RANK else "na"
+                if cm:
+                    r.comments[c] = cm
+            r.test_ideas = _strs(res.get("test_ideas"), 3)
+            r.questions = _strs(res.get("questions"), 2)
             for f in res.get("findings") or []:
                 if not isinstance(f, dict):
                     continue
@@ -187,65 +236,52 @@ def review_requirements(doc: Document, reqs: list[Requirement], llm, batch_size:
                 q, g1, g2, ok = _anchor(doc, str(f.get("quote") or ""), r)
                 r.findings.append(Finding(criterion=c, severity=_sev(f.get("severity")), problem=problem,
                                           recommendation=collapse_ws(str(f.get("recommendation") or "")),
-                                          quote=q, g1=g1, g2=g2, verified=ok, req_ids=[r.id],
-                                          source="LLM" if llm.model != "mock" else "правило"))
+                                          quote=q, g1=g1, g2=g2, verified=ok, req_ids=[r.id], tag=_tag(f.get("tag")),
+                                          source="правило" if is_mock else "LLM"))
 
     # правила: добавляем значимые срабатывания, которые модель не учла
     for r in reqs:
         if not r.reviewed:
             r.criteria = {c: "na" for c in INDIVIDUAL}
-            if llm.model != "mock":
+            if not is_mock:
                 warnings.append(f"{r.id}: модель не вернула результат проверки; применены только правила.")
-        if llm.model == "mock" and r.reviewed:
-            continue
-        for h in hints[r.id]:
-            if r.reviewed and h["severity"] == "minor":
-                continue
-            trig = norm(h["trigger"])
-            covered = any(trig and f.verified and trig in norm(f.quote) and (f.criterion in h["criteria"])
-                          for f in r.findings)
-            if covered:
-                continue
-            q, g1, g2, ok = _anchor(doc, h["quote"], r)
-            r.findings.append(Finding(criterion=h["criterion"], severity=h["severity"], problem=h["problem"],
-                                      recommendation=h["recommendation"], quote=q, g1=g1, g2=g2, verified=ok,
-                                      req_ids=[r.id], source="правило"))
+        if not (is_mock and r.reviewed):
+            for h in hints[r.id]:
+                if r.reviewed and h["severity"] == "minor":
+                    continue
+                trig = norm(h["trigger"])
+                covered = any(trig and f.verified and trig in norm(f.quote) and (f.criterion in h["criteria"])
+                              for f in r.findings)
+                if covered:
+                    continue
+                q, g1, g2, ok = _anchor(doc, h["quote"], r)
+                r.findings.append(Finding(criterion=h["criterion"], severity=h["severity"], problem=h["problem"],
+                                          recommendation=h["recommendation"], quote=q, g1=g1, g2=g2, verified=ok,
+                                          req_ids=[r.id], source="правило",
+                                          tag=h.get("tag") or RULE_TAGS.get(h["criterion"], "")))
         for f in r.findings:
-            r.criteria[f.criterion] = "fail"
+            _bump(r, f.criterion, "warn" if f.severity == "minor" else "fail")
         r.findings.sort(key=lambda f: (SEVERITY_ORDER[f.severity], list(INDIVIDUAL).index(f.criterion)))
 
 
 # ------------------------------------------------------------------ 3. проверка набора
-def review_set(doc: Document, reqs: list[Requirement], llm, warnings: list[str]):
-    log("[3/3] Проверка набора требований целиком…")
-    if doc.char_count() <= SET_FULL_DOC_CHARS:
-        doc_text = doc.numbered()
-    else:
-        doc_text = "(документ большой — приведена структура заголовков)\n" + doc.headings_outline()
-    rl = [{"id": r.id, "doc_id": r.doc_id, "text": r.text, "g1": r.g1} for r in reqs]
-    try:
-        data = llm.generate_json("set", prompts.SYSTEM, prompts.set_prompt(doc.title, doc_text, rl), {"requirements": rl})
-    except LLMError as e:
-        warnings.append(f"Проверка набора моделью не выполнена: {e}. Применены только правила.")
-        data = {}
-    if not isinstance(data, dict):
-        data = {}
-    by_id = {r.id: r for r in reqs}
-    findings: list[Finding] = []
-    dropped = 0
-    for f in data.get("findings") or []:
+def _set_findings_from(data: dict, doc: Document, by_id: dict, counters: dict) -> list[Finding]:
+    out = []
+    for f in (data.get("findings") or []) if isinstance(data, dict) else []:
         if not isinstance(f, dict):
             continue
         ids = [i for i in (str(x).strip() for x in (f.get("requirement_ids") or [])) if i in by_id]
         near = (by_id[ids[0]].g1, by_id[ids[0]].g2) if ids else None
         quotes, locs = [], []
-        for q in f.get("quotes") or []:
-            hit = doc.find(str(q), near=near)
+        for q in _strs(f.get("quotes"), 6):
+            hit = doc.find(q, near=near)
             if hit:
                 quotes.append(hit[0])
                 locs.append((hit[1], hit[2]))
+            else:
+                counters["bad_quotes"] += 1
         if not quotes and not ids:
-            dropped += 1
+            counters["dropped"] += 1
             continue
         c = str(f.get("criterion", "")).upper().strip()
         if c not in SET:
@@ -255,47 +291,123 @@ def review_set(doc: Document, reqs: list[Requirement], llm, warnings: list[str])
             continue
         fd = Finding(criterion=c, severity=_sev(f.get("severity")), problem=problem,
                      recommendation=collapse_ws(str(f.get("recommendation") or "")),
-                     quote=" … ".join(f"«{q}»" for q in quotes), req_ids=ids,
-                     type=collapse_ws(str(f.get("type") or "Прочее")), verified=bool(quotes))
+                     quotes=quotes, quote=" … ".join(f"«{q}»" for q in quotes), req_ids=ids,
+                     type=collapse_ws(str(f.get("type") or "Прочее")), tag=_tag(f.get("tag")),
+                     verified=bool(quotes), locs=locs)
         if locs:
             fd.g1, fd.g2 = locs[0]
-            fd._locs = locs  # type: ignore[attr-defined]
-        findings.append(fd)
-    if dropped:
-        warnings.append(f"{dropped} замечание(й) к набору отброшено: модель не привела ни подтверждаемой цитаты, "
-                        "ни ссылки на требование.")
+        out.append(fd)
+    return out
 
-    # если модель отметила «соответствие форме» почти у всех требований — это свойство документа, а не
-    # отдельных требований: сворачиваем в одно замечание к набору, чтобы не засорять отчёт
+
+def _covered(rule: dict, findings: list[Finding]) -> bool:
+    rule_gids = {g for g, _ in rule["locs"]}
+    for f in findings:
+        if f.tag and f.tag == rule["tag"] and (rule["tag"] not in ("PLACEHOLDER", "SECTION-EMPTY")
+                                               or any(a <= g <= b for g in rule_gids for a, b in f.locs)):
+            return True
+        if f.criterion == rule["criterion"] and any(a <= g <= b for g in rule_gids for a, b in f.locs):
+            return True
+    return False
+
+
+def review_set(doc: Document, reqs: list[Requirement], llm, warnings: list[str]):
+    if doc.char_count() <= SET_FULL_DOC_CHARS:
+        doc_text = doc.numbered()
+    else:
+        doc_text = "(документ большой — приведена структура заголовков)\n" + doc.headings_outline()
+    rl = [{"id": r.id, "doc_id": r.doc_id, "text": r.text, "g1": r.g1} for r in reqs]
+    by_id = {r.id: r for r in reqs}
+    doc_rules = rules.check_document(doc)
+    hints = [f"[{h['tag']}] {h['problem']} (строки: {', '.join('L' + str(g) for g, _ in h['locs'])})" for h in doc_rules]
+    counters = {"dropped": 0, "bad_quotes": 0}
+    findings: list[Finding] = []
+    sc_raw: dict = {}
+    edge_cases, trace = [], []
+    for step, (part, title) in enumerate([("consistency", "непротиворечивость, архитектура и стандарты"),
+                                          ("completeness", "полнота, пограничные сценарии, прослеживаемость")], 1):
+        log(f"[3/4] Проверка набора требований ({step}/2: {title})…")
+        try:
+            data = llm.generate_json(f"set_{part}", prompts.SYSTEM,
+                                     prompts.set_prompt(part, doc.title, doc_text, rl, hints), {"requirements": rl})
+        except LLMError as e:
+            warnings.append(f"Проверка набора ({title}) моделью не выполнена: {e}. Применены только правила.")
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        findings += _set_findings_from(data, doc, by_id, counters)
+        if isinstance(data.get("set_criteria"), dict):
+            sc_raw.update(data["set_criteria"])
+        for e in data.get("edge_cases") or []:
+            if isinstance(e, dict) and collapse_ws(str(e.get("scenario") or "")):
+                edge_cases.append({"scenario": collapse_ws(str(e.get("scenario"))),
+                                   "req_ids": [i for i in _strs(e.get("requirement_ids"), 6) if i in by_id],
+                                   "risk": collapse_ws(str(e.get("risk") or "")),
+                                   "question": collapse_ws(str(e.get("question") or ""))})
+        for t in data.get("traceability") or []:
+            if isinstance(t, dict) and str(t.get("requirement", "")).strip() in by_id:
+                trace.append({"req": str(t["requirement"]).strip(),
+                              **{k: [i for i in _strs(t.get(k), 8) if i in by_id]
+                                 for k in ("goal", "ui", "api_data", "acceptance")},
+                              "gap": collapse_ws(str(t.get("gap") or ""))})
+    if counters["dropped"]:
+        warnings.append(f"{counters['dropped']} замечание(й) к набору отброшено: модель не привела ни подтверждаемой "
+                        "цитаты, ни ссылки на требование.")
+    if counters["bad_quotes"]:
+        warnings.append(f"{counters['bad_quotes']} цитат(ы) модели в замечаниях к набору не найдены в документе "
+                        "дословно и исключены из отчёта (сами замечания сохранены, если есть другие подтверждения).")
+
+    # детерминированные проверки документа — добавляем, если модель их не нашла
+    for h in doc_rules:
+        if _covered(h, findings):
+            continue
+        quotes, locs = [], []
+        for g, q in h["locs"]:
+            hit = doc.find(q, near=(g, g))
+            if hit:
+                quotes.append(hit[0])
+                locs.append((hit[1], hit[2]))
+        if not quotes:
+            continue
+        ids = [r.id for r in reqs if any(r.g1 <= a <= r.g2 for a, _ in locs)]
+        findings.append(Finding(criterion=h["criterion"], severity=h["severity"], problem=h["problem"],
+                                recommendation=h["recommendation"], quotes=quotes,
+                                quote=" … ".join(f"«{q}»" for q in quotes), req_ids=ids, type=h["type"], tag=h["tag"],
+                                source="правило", locs=locs, g1=locs[0][0], g2=locs[0][1]))
+
+    # если модель отметила «соответствие форме» почти у всех требований — это свойство документа
     cnf_reqs = [r for r in reqs if any(f.criterion == "CNF" and f.severity == "minor" for f in r.findings)]
     if reqs and len(cnf_reqs) >= max(5, 0.6 * len(reqs)):
         sample = next(f for f in cnf_reqs[0].findings if f.criterion == "CNF")
         for r in cnf_reqs:
             r.findings = [f for f in r.findings if not (f.criterion == "CNF" and f.severity == "minor")]
-            r.criteria["CNF"] = "fail"
+            r.criteria["CNF"] = "warn"
         findings.append(Finding(
-            criterion="S-COMP", severity="minor", type="Несогласованность",
+            criterion="S-COMP", severity="minor", type="Несогласованность", tag="FORMAT",
             problem=f"У {len(cnf_reqs)} из {len(reqs)} требований формулировка не соответствует шаблону "
                     f"(пример — {cnf_reqs[0].id}: {sample.problem})",
             recommendation="Привести требования к единому шаблону «<Субъект> должен <действие> <условие>» "
                            "с уникальным идентификатором.",
             req_ids=[r.id for r in cnf_reqs][:15], g1=cnf_reqs[0].g1, g2=cnf_reqs[0].g2, source="правило"))
 
-    # правила набора
+    # правила набора (ID, дубли)
     rd = [{"id": r.id, "doc_id": r.doc_id, "text": r.text} for r in reqs]
     for h in rules.check_set(rd):
         if h["type"] == "Дублирование" and any(set(h["requirement_ids"]) <= set(f.req_ids) for f in findings):
             continue
+        if h["criterion"] == "S-TRC" and any(f.criterion == "S-TRC" and f.source == "LLM" for f in findings):
+            continue
         findings.append(Finding(criterion=h["criterion"], severity=h["severity"], problem=h["problem"],
-                                recommendation=h["recommendation"], req_ids=h["requirement_ids"],
-                                type=h["type"], source="правило"))
+                                recommendation=h["recommendation"], req_ids=h["requirement_ids"], type=h["type"],
+                                tag="TRACEABILITY" if h["criterion"] == "S-TRC" else "DUPLICATE", source="правило"))
     for f in findings:
         if f.g1 is None and f.req_ids:
             r0 = by_id[f.req_ids[0]]
             f.g1, f.g2 = r0.g1, r0.g2
+        if not f.locs and f.g1 is not None:
+            f.locs = [(f.g1, f.g2)]
     findings.sort(key=lambda f: (SEVERITY_ORDER[f.severity], list(SET).index(f.criterion)))
 
-    sc_raw = data.get("set_criteria") or {}
     set_criteria = {}
     for c in SET:
         v = sc_raw.get(c) if isinstance(sc_raw, dict) else None
@@ -308,10 +420,8 @@ def review_set(doc: Document, reqs: list[Requirement], llm, warnings: list[str])
             status = "partial"
         elif not status:
             status = "ok" if llm.model != "mock" else "n/a"
-        if not comment:
-            comment = ("Замечания: " + ", ".join(f.fid or "" for f in related)) if related else ""
         set_criteria[c] = {"status": status, "comment": comment, "findings": related}
-    return findings, set_criteria
+    return findings, set_criteria, edge_cases, trace
 
 
 # ------------------------------------------------------------------ всё вместе
@@ -326,9 +436,9 @@ def run(doc: Document, llm, batch_size: int = 8) -> Result:
     if not reqs:
         warnings.append("В документе не найдено ни одного требования.")
     review_requirements(doc, reqs, llm, batch_size, warnings)
-    set_findings, set_criteria = review_set(doc, reqs, llm, warnings)
+    set_findings, set_criteria, edge_cases, trace = review_set(doc, reqs, llm, warnings)
+    log("[4/4] Верификация цитат и формирование отчёта…")
 
-    # нумерация замечаний
     n = 0
     for r in reqs:
         for f in r.findings:
@@ -337,10 +447,14 @@ def run(doc: Document, llm, batch_size: int = 8) -> Result:
     for i, f in enumerate(set_findings, 1):
         f.fid = f"S-{i:02d}"
     for c, v in set_criteria.items():
-        if v["findings"] and v["comment"].startswith("Замечания: "):
+        if v["findings"] and not v["comment"]:
             v["comment"] = "Замечания: " + ", ".join(f.fid for f in v["findings"])
 
     all_f = [f for r in reqs for f in r.findings] + set_findings
+    by_part: dict[str, int] = {}
+    for f in all_f:
+        p = doc.part_of(f.g1) if f.g1 is not None else ""
+        by_part[p or "—"] = by_part.get(p or "—", 0) + 1
     stats = {
         "requirements": len(reqs),
         "with_issues": sum(1 for r in reqs if r.findings),
@@ -350,9 +464,11 @@ def run(doc: Document, llm, batch_size: int = 8) -> Result:
         "set_findings": len(set_findings),
         "by_severity": {s: sum(1 for f in all_f if f.severity == s) for s in SEVERITY},
         "by_criterion": {c: sum(1 for r in reqs for f in r.findings if f.criterion == c) for c in INDIVIDUAL},
+        "by_part": by_part,
         "unverified": sum(1 for f in all_f if not f.verified and f.source == "LLM"),
+        "rule_findings": sum(1 for f in all_f if f.source == "правило"),
         "mock": llm.model == "mock",
     }
     return Result(doc=doc, model_name=llm.name, requirements=reqs, set_findings=set_findings,
-                  set_criteria=set_criteria, stats=stats, warnings=warnings, started=started,
-                  finished=time.time(), llm_calls=llm.calls)
+                  set_criteria=set_criteria, edge_cases=edge_cases, traceability=trace, stats=stats,
+                  warnings=warnings, started=started, finished=time.time(), llm_calls=llm.calls)

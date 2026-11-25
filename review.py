@@ -54,12 +54,18 @@ def agent_version() -> str:
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(
         description="ИИ-агент статической проверки документа требований (ISO/IEC/IEEE 29148, IEEE 830).")
-    p.add_argument("input", help="путь к документу требований (.pdf, .docx, .md, .txt)")
-    p.add_argument("output", help="путь к файлу отчёта (.md); рядом будет создан .json")
+    p.add_argument("input", nargs="?", help="путь к документу требований (.pdf, .docx, .md, .txt)")
+    p.add_argument("output", nargs="?", help="путь к файлу отчёта (.md); рядом будет создан .json")
+    p.add_argument("--input", "-i", dest="input_opt", help="то же, что позиционный аргумент input")
+    p.add_argument("--output", "-o", dest="output_opt", help="то же, что позиционный аргумент output")
     p.add_argument("--model", help="модель Gemini (по умолчанию из .env или gemini-3.8-flash)")
     p.add_argument("--batch-size", type=int, default=None, help="сколько требований проверять за один запрос (по умолчанию 8)")
     p.add_argument("--mock", action="store_true", help="демо-режим без ключа и без LLM (только правила) — для проверки установки")
     a = p.parse_args(argv)
+    a.input = a.input_opt or a.input
+    a.output = a.output_opt or a.output or "reports/report.md"
+    if not a.input:
+        p.error("укажите путь к документу требований, например: python review.py docs/requirements.md reports/report.md")
 
     try:
         from dotenv import load_dotenv

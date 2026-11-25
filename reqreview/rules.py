@@ -223,3 +223,136 @@ def check_set(reqs: list[dict]) -> list[dict]:
             "recommendation": "Присвоить идентификаторы всем требованиям.",
         })
     return out
+
+
+# ====================================================================== проверки документа целиком
+def _ctx_line(text: str, m: re.Match, words: int = 4) -> str:
+    return _context(text, m.start(), m.end(), words)
+
+
+def check_document(doc) -> list[dict]:
+    """Детерминированные проверки по всему тексту документа (единицы измерения, HTTP-семантика,
+    заглушки шаблона). Возвращает замечания к набору с дословными цитатами и строками."""
+    lines = [ln for ln in doc.lines if ln.text.strip()]
+    out: list[dict] = []
+
+    def find(rx, flags=_I):
+        r = re.compile(rx, flags)
+        return [(ln, m) for ln in lines for m in [r.search(ln.text)] if m]
+
+    # 1. Единицы измерения: тиыны и тенге без правила конвертации
+    # общий случай: дробная денежная единица (тиын, копейка, цент) и основная (тенге, рубль, доллар…)
+    tiyn = find(r"\b(тиын|копе[йе]к|копейк|цент|cents?|minor\s+units?)\w*")
+    tenge = find(r"\b(тенге|рубл|доллар|евро|сом|сум|dollars?|tenge|rubles?)\w*|[₸₽$€]")
+    conv = find(r"конверт\w*|пересч[её]т\w*\s+(в|из)\s+(тиын|копе|цент|тенге|рубл)|=\s*100\s*(тиын|копе|цент)|"
+                r"×\s?100|\*\s?100|/\s?100\b|\b100\s+(тиын|копе|цент|cents)")
+    if tiyn and tenge and not conv:
+        a, b = tiyn[0], next((t for t in tenge if t[0].gid != tiyn[0][0].gid), tenge[0])
+        out.append({
+            "type": "Несогласованность", "criterion": "S-CONS", "severity": "major", "tag": "UNITS",
+            "locs": [(a[0].gid, _ctx_line(a[0].text, a[1])), (b[0].gid, _ctx_line(b[0].text, b[1]))],
+            "problem": f"Денежные суммы задаются в разных единицах: «{a[1].group(0)}» (дробная единица) и "
+                       f"«{b[1].group(0)}» (основная единица); правило конвертации и округления в документе не описано. "
+                       "Риск ошибки в 100 раз при сравнении и передаче сумм между системами.",
+            "recommendation": "Зафиксировать единую единицу хранения и передачи сумм (например, целое число в "
+                              "дробных единицах) и явно описать конвертацию и округление на границах API/UI.",
+        })
+
+    # 2. HTTP GET для операции, изменяющей состояние
+    get_ = find(r"\bGET\b|curl\s+-G\b", 0)
+    mut = find(r"/[\w/]*(save|update|create|delete|set|add|remove)\w*|\bсохранени\w*|\bсохраня\w*|\bзаменить\b|\bизменени\w*")
+    if get_ and mut:
+        g = get_[0]
+        mm = next((x for x in mut if "/" in x[1].group(0)), mut[0])
+        out.append({
+            "type": "Нарушение стандарта", "criterion": "S-FEAS", "severity": "critical", "tag": "REST-METHOD",
+            "locs": [(g[0].gid, _ctx_line(g[0].text, g[1])), (mm[0].gid, _ctx_line(mm[0].text, mm[1]))],
+            "problem": "Для операции, изменяющей состояние (сохранение/замена настройки), указан HTTP-метод GET. "
+                       "По RFC 9110 (§9.2.1) GET — безопасный метод без побочных эффектов: запрос могут повторить "
+                       "или закешировать прокси/браузер, параметры попадают в логи и историю.",
+            "recommendation": "Использовать POST (создание/сохранение) или PUT (идемпотентная замена) и передавать "
+                              "параметры в теле запроса (application/json).",
+        })
+
+    # 3. Ошибка под кодом 200
+    cand = [i for i, ln in enumerate(lines) if re.search(r"\b200\b", ln.text) and re.search(r"success|успеш", ln.text, _I)]
+    cand.sort(key=lambda i: (not lines[i].text.lstrip().startswith("#"), i))
+    for i in cand:
+        ln = lines[i]
+        window = lines[i:i + 10]
+        err = next(((w, m) for w in window for m in [re.search(r'"result"\s*:\s*"ERROR"', w.text)] if m), None)
+        if err is not None:
+            if err:
+                out.append({
+                    "type": "Нарушение стандарта", "criterion": "S-FEAS", "severity": "critical", "tag": "STATUS-200",
+                    "locs": [(ln.gid, collapse(ln.text)), (err[0].gid, _ctx_line(err[0].text, err[1]))],
+                    "problem": "В разделе успешного ответа 200 приведён пример с результатом ERROR: ошибка бизнес-логики "
+                               "маскируется под успешный HTTP-код, клиент и мониторинг не отличат успех от отказа.",
+                    "recommendation": "Для ошибок валидации возвращать 400 Bad Request (или 422) с телом ошибки; "
+                                      "код 200/201 — только для успешного сохранения.",
+                })
+                break
+
+    # 4. Заглушки и незаполненные места шаблона
+    ph = find(r"заполня\w+\s+\w+|\bTBD\b|\bTBC\b|\bTODO\b|буд(ет|ут)\s+(определ|уточн|описан|добавлен)\w*|"
+              r"(уточня|определя|описыва)\w*\s+позже|раздел\s+в\s+разработке")
+    for ln, m in ph[:3]:
+        out.append({
+            "type": "Незаполненный раздел", "criterion": "S-COMPL", "severity": "major", "tag": "SECTION-EMPTY",
+            "locs": [(ln.gid, _ctx_line(ln.text, m))],
+            "problem": f"Раздел не заполнен — вместо содержания заглушка «{m.group(0)}» "
+                       f"(раздел «{doc.section_of(ln.gid) or '—'}»).",
+            "recommendation": "Заполнить раздел до передачи в разработку (для тестирования — тестовые сценарии, "
+                              "включая негативные и граничные).",
+        })
+    yn = [ln for ln in lines if re.search(r"Да\s*/\s*Нет", ln.text)]
+    if len(yn) >= 3:
+        out.append({
+            "type": "Незаполненный раздел", "criterion": "S-COMPL", "severity": "minor", "tag": "PLACEHOLDER",
+            "locs": [(yn[0].gid, collapse(yn[0].text)[:160])],
+            "problem": f"Чек-лист ревью не заполнен: в {len(yn)} строках оставлены варианты «Да / Нет» без отметки — "
+                       "ревью требований формально не проведено.",
+            "recommendation": "Провести ревью и проставить отметки «Да»/«Нет»/«Не требуется» с примечаниями.",
+        })
+    empty_rows = [ln for ln in lines if re.fullmatch(r"\|(\s*\|)+\s*", ln.text.strip())]
+    if empty_rows:
+        out.append({
+            "type": "Незаполненный раздел", "criterion": "S-COMPL", "severity": "minor", "tag": "APPROVALS",
+            "locs": [(empty_rows[0].gid, empty_rows[0].text.strip())],
+            "problem": f"Пустая строка таблицы (раздел «{doc.section_of(empty_rows[0].gid) or '—'}»): "
+                       "не указаны подразделения/ответственные.",
+            "recommendation": "Заполнить таблицу (например, блок согласующих: подразделение, ФИО, подпись/дата).",
+        })
+    dash = find(r"(Prod|Swagger|URL)[^|]*\|\s*—\s*\||Prod:\s*—")
+    for ln, m in dash[:2]:
+        out.append({
+            "type": "Незаполненный раздел", "criterion": "S-COMPL", "severity": "minor", "tag": "PLACEHOLDER",
+            "locs": [(ln.gid, collapse(ln.text)[:160])],
+            "problem": "Параметр спецификации не заполнен (стоит «—»).",
+            "recommendation": "Указать значение или явно отметить «не применяется» с причиной.",
+        })
+    ver = find(r"верси\w*[^.]*не\s+заполн\w*|не\s+заполн\w*[^.]*верси\w*")
+    if ver:
+        ln, m = ver[0]
+        out.append({
+            "type": "Версионность", "criterion": "S-MOD", "severity": "minor", "tag": "VERSIONING",
+            "locs": [(ln.gid, _ctx_line(ln.text, m, 2))],
+            "problem": "Версия и дата документа не заполнены — нельзя однозначно сослаться на согласованную редакцию.",
+            "recommendation": "Указать версию, дату и историю изменений документа.",
+        })
+
+    # 5. Заголовок Content-Type при отсутствии тела
+    ct = find(r"Content-Type[^a-z]*application/json")
+    nobody = find(r"Тело\s+не\s+использ\w*|body\s+is\s+not\s+used")
+    if ct and nobody:
+        out.append({
+            "type": "Несогласованность", "criterion": "S-CONS", "severity": "minor", "tag": "FORMAT",
+            "locs": [(ct[0][0].gid, _ctx_line(ct[0][0].text, ct[0][1])), (nobody[0][0].gid, _ctx_line(nobody[0][0].text, nobody[0][1]))],
+            "problem": "Указан Content-Type application/json, но тело запроса не используется — заголовок вводит в заблуждение.",
+            "recommendation": "Либо передавать параметры в JSON-теле (вместе с переходом на POST/PUT), либо убрать требование к Content-Type.",
+        })
+    return out
+
+
+def collapse(s: str) -> str:
+    return re.sub(r"\s+", " ", s).strip()
