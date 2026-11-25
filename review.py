@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import subprocess
 import sys
 from pathlib import Path
 
@@ -24,13 +23,31 @@ for stream in (sys.stdout, sys.stderr):
         pass
 
 
+def _git_commit() -> str:
+    """Читает текущий коммит прямо из .git (без вызова git — на macOS без Xcode
+    вызов git открывает окно установки)."""
+    g = ROOT / ".git"
+    try:
+        head = (g / "HEAD").read_text().strip()
+        if not head.startswith("ref:"):
+            return head[:7]
+        ref = head.split(":", 1)[1].strip()
+        f = g / ref
+        if f.exists():
+            return f.read_text().strip()[:7]
+        packed = g / "packed-refs"
+        if packed.exists():
+            for line in packed.read_text().splitlines():
+                if line.endswith(" " + ref):
+                    return line.split()[0][:7]
+    except OSError:
+        pass
+    return ""
+
+
 def agent_version() -> str:
     from reqreview import __version__
-    try:
-        commit = subprocess.run(["git", "-C", str(ROOT), "describe", "--tags", "--always", "--dirty"],
-                                capture_output=True, text=True, timeout=5).stdout.strip()
-    except Exception:  # noqa: BLE001
-        commit = ""
+    commit = _git_commit()
     return f"v{__version__}" + (f" (коммит {commit})" if commit else " (коммит неизвестен: запуск не из git-репозитория)")
 
 
