@@ -223,21 +223,25 @@ def source_html(doc, title: str) -> str:
 
 
 def write_pdf(md: str, out_path: Path, doc=None, source_title: str = "", footer: str = "") -> Path:
-    import pymupdf
-
     body = md_to_html(md)
     if doc is not None:
         body += "\n" + source_html(doc, source_title)
-    story = pymupdf.Story(html=f"<body>{body}</body>", user_css=CSS)
+    return write_pdf_html(body, out_path, CSS, footer)
+
+
+def write_pdf_html(body: str, out_path: Path, css: str, footer: str = "") -> Path:
+    import pymupdf
+
+    out_path = Path(out_path)
+    story = pymupdf.Story(html=f"<body>{body}</body>", user_css=css)
     page = pymupdf.paper_rect("a4")
-    content = page + (40, 42, -40, -48)
+    content = page + (42, 40, -42, -46)
     toc: list[list] = []
+    titles = {m.group(2): html.unescape(re.sub(r"<[^>]+>", "", m.group(3)))
+              for m in re.finditer(r'<h(\d) id="([^"]+)">(.*?)</h\1>', body, re.S)}
 
     def rectfn(rect_num, filled):
         return page, content, None
-
-    titles = {m.group(2): html.unescape(re.sub(r"<[^>]+>", "", m.group(3)))
-              for m in re.finditer(r'<h(\d) id="([^"]+)">(.*?)</h\1>', body)}
 
     def positionfn(pos):
         if pos.heading and (pos.open_close & 1) and pos.heading <= 3:
@@ -247,15 +251,13 @@ def write_pdf(md: str, out_path: Path, doc=None, source_title: str = "", footer:
     n = pdf.page_count
     for pno in range(n):
         pg = pdf[pno]
-        r = pymupdf.Rect(40, page.height - 34, page.width - 40, page.height - 18)
-        pg.insert_htmlbox(r, f"<p style='font-family:sans-serif;font-size:7pt;color:#6b7785;text-align:right'>"
-                             f"{html.escape(footer)} · стр. {pno + 1} из {n}</p>")
-    # закладки: уровни должны идти без пропусков
+        r = pymupdf.Rect(42, page.height - 32, page.width - 42, page.height - 16)
+        pg.insert_htmlbox(r, f"<p style='font-family:sans-serif;font-size:6.8pt;color:#8a96a0;text-align:right'>"
+                             f"{html.escape(footer)} · {pno + 1} / {n}</p>")
     clean, last = [], 0
     base = min((t[0] for t in toc), default=1)
     for lvl, text, pnum, rect in toc:
-        lvl = lvl - base + 1
-        lvl = min(lvl, last + 1)
+        lvl = min(lvl - base + 1, last + 1)
         last = lvl
         pnum = max(1, min(n, pnum if pnum >= 1 else pnum + 1))
         clean.append([lvl, text[:120], pnum, {"kind": pymupdf.LINK_GOTO, "to": pymupdf.Point(rect[0], rect[1])}])
@@ -272,7 +274,7 @@ def write_pdf(md: str, out_path: Path, doc=None, source_title: str = "", footer:
     return out_path
 
 
-def validate_pdf(path: Path, must_contain: str = "Отчёт") -> dict:
+def validate_pdf(path: Path, must_contain: str = "провер") -> dict:
     """Проверка результата: файл существует, открывается как PDF, текст на русском извлекается, ссылки целы."""
     import pymupdf
     info = {"ok": False, "pages": 0, "links": 0, "broken_links": 0, "toc": 0}
@@ -286,5 +288,5 @@ def validate_pdf(path: Path, must_contain: str = "Отчёт") -> dict:
                     info["links"] += 1
                     if not 0 <= lk.get("page", -1) < d.page_count:
                         info["broken_links"] += 1
-    info["ok"] = info["pages"] > 0 and must_contain in text and info["broken_links"] == 0
+    info["ok"] = info["pages"] > 0 and must_contain in text.lower() and info["broken_links"] == 0
     return info

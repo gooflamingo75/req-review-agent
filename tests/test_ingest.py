@@ -170,14 +170,32 @@ def test_full_report_pdf_and_links():
     import pymupdf
     with pymupdf.open(str(files["pdf"])) as d:
         text = "".join(p.get_text() for p in d)
-        assert "Панель: дефекты" in text and "Исходный текст" in text and "₸" in text
+        assert "Резюме для руководителя" in text and "Исходный текст" in text and "₸" in text
         links = [lk for p in d for lk in p.get_links() if lk.get("kind") == pymupdf.LINK_GOTO]
         assert links and all(0 <= lk["page"] < d.page_count for lk in links)
         assert d.get_toc()
     md = files["md"].read_text(encoding="utf-8")
-    assert md.index("Панель: дефекты") < md.index("## 1. Паспорт прогона")
+    assert md.index("Резюме для руководителя") < md.index("## 1. Паспорт прогона") < md.index("## 6. Итоговый")
     # каждая строка исходного файла есть в приложении
     assert md.count("\nL0") >= len(doc.lines)
+    # требования без замечаний не получают отдельной карточки
+    clean = [r for r in res.requirements if not r.findings and not r.linked and not r.questions
+             and not any(st in ("warn", "fail") for st in r.criteria.values())]
+    for r in clean:
+        assert f"#### {r.id}" not in md
+
+
+def test_rerender_from_json():
+    """Отчёт перестраивается из сохранённого JSON без модели и совпадает с исходным."""
+    import json
+    from reqreview.report import write_data
+    doc = load_document(SAMPLE)
+    res = run(doc, MockLLM(), batch_size=8)
+    f1 = write(res, TMP / "a.md", "test", "sample.md")
+    data = json.loads(f1["json"].read_text(encoding="utf-8"))
+    f2 = write_data(data, load_document(SAMPLE), TMP / "b.md", "test")
+    assert f1["md"].read_text(encoding="utf-8") == f2["md"].read_text(encoding="utf-8")
+    assert f2["pdf"] and f2["pdf"].exists()
 
 
 def test_ocr_uncertain_token_not_critical():

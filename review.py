@@ -66,6 +66,8 @@ def main(argv=None) -> int:
     p.add_argument("--model", help="модель Gemini (по умолчанию из .env или gemini-3.8-flash)")
     p.add_argument("--batch-size", type=int, default=None, help="сколько требований проверять за один запрос (по умолчанию 8)")
     p.add_argument("--mock", action="store_true", help="демо-режим без ключа и без LLM (только правила) — для проверки установки")
+    p.add_argument("--from-json", dest="from_json", help="перестроить отчёт (PDF/MD) из сохранённого report.json без "
+                   "обращения к модели; input — тот же документ (для приложения «Исходный текст»)")
     a = p.parse_args(argv)
     a.input = a.input_opt or a.input
     a.output = a.output_opt or a.output or "reports/report.md"
@@ -99,6 +101,19 @@ def main(argv=None) -> int:
             print(f"  ⚠ PDF не создан: {files.get('pdf_error')}", file=sys.stderr)
         print(f"  Отчёт (Markdown): {files['md'].resolve()}", file=sys.stderr)
         print(f"  Данные (JSON): {files['json'].resolve()}", file=sys.stderr)
+
+    if a.from_json:
+        import json as _json
+        from reqreview.report import write_data
+        data = _json.loads(Path(a.from_json).read_text(encoding="utf-8"))
+        doc = load_document(a.input)
+        if (data.get("document") or {}).get("sha256") not in (None, doc.sha256):
+            print("ОШИБКА: документ отличается от того, по которому создан JSON (SHA-256 не совпадает).", file=sys.stderr)
+            return 2
+        data["render"] = {"rerendered_by": version}
+        files = write_data(data, doc, a.output, version)
+        report_files(files, f"Отчёт перестроен из {a.from_json} (модель не вызывалась):")
+        return 0 if files.get("pdf") else 4
 
     try:
         doc = load_document(a.input)
