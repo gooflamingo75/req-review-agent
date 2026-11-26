@@ -27,9 +27,58 @@ _LINE_REF = re.compile(r"\[L(\d+)\]|\bстрок[аеиу]?\s+(\d+)", re.I)
 
 
 # ------------------------------------------------------------------ 1. критик
-def critic(doc, reqs, set_findings, llm, doc_text: str, prompts_mod, warnings: list[str], cov=None) -> list[dict]:
+_FID = re.compile(r"\b(?:F-\d{3}|S-\d{2}|EC-\d{2}|Q-\d{2})\b")
+
+
+def _lines_of(f) -> set[int]:
+    out = set()
+    for a, b in (f.locs or []):
+        out |= set(range(a, (b if b is not None else a) + 1))
+    if f.g1 is not None:
+        out |= set(range(f.g1, (f.g2 if f.g2 is not None else f.g1) + 1))
+    return out
+
+
+def restamp_dropped(dropped: list[dict]) -> None:
+    """Ссылки на номера дефектов в причинах отклонения пересчитываются после окончательной нумерации:
+    живой дефект → его итоговый номер, отклонённый → его номер в журнале (D-xx), иначе ссылка убирается."""
+    index = dropped[0].get("_index") if dropped else None
+    for i, d in enumerate(dropped, 1):
+        d["id"] = f"D-{i:02d}"
+    if not index:
+        return
+    old_to_d = {d.get("_old"): d["id"] for d in dropped}
+
+    def sub(m):
+        k = m.group(0)
+        if k in old_to_d:
+            return old_to_d[k]
+        obj = index.get(k)
+        obj = obj[1] if isinstance(obj, tuple) else obj
+        fid = getattr(obj, "fid", None) if obj is not None else None
+        return fid if fid and not getattr(obj, "_dropped", False) else "этот дефект"
+    for d in dropped:
+        for key in ("reason", "problem"):
+            if d.get(key):
+                d[key] = _FID.sub(sub, d[key])
+        d.pop("_index", None)
+        d.pop("_old", None)
+
+
+def critic(doc, reqs, set_findings, llm, doc_text: str, prompts_mod, warnings: list[str], cov=None,
+           edge_cases=None) -> list[dict]:
     """Возвращает список отклонённых дефектов (для приложения отчёта)."""
     items, index = [], {}
+    edge_cases = edge_cases if edge_cases is not None else []
+    for i, e in enumerate(edge_cases, 1):
+        items.append({"id": f"EC-{i:02d}", "level": "пограничный сценарий", "requirements": e.get("req_ids"),
+                      "problem": e["scenario"], "risk": e.get("risk", ""), "question": e.get("question", "")})
+    qmap, qn = {}, 0
+    for r in reqs:
+        for j, q in enumerate(r.questions):
+            qn += 1
+            qmap[f"Q-{qn:02d}"] = (r, j)
+            items.append({"id": f"Q-{qn:02d}", "level": "вопрос", "requirement": r.id, "problem": q})
     for r in reqs:
         for f in r.findings:
             index[f.fid] = (r, f)
@@ -62,19 +111,48 @@ def critic(doc, reqs, set_findings, llm, doc_text: str, prompts_mod, warnings: l
             cov.check("critic", title, "не выполнена", str(e)[:200])
         return []
     dropped, changed = [], 0
+    answered_ec, answered_q = set(), set()
     for rv in (data.get("reviews") or []) if isinstance(data, dict) else []:
-        if not isinstance(rv, dict) or rv.get("id") not in index:
+        if not isinstance(rv, dict):
+            continue
+        rid = str(rv.get("id") or "")
+        if (rid.startswith("EC-") or rid.startswith("Q-")) and str(rv.get("verdict", "")).lower() == "drop":
+            ev = collapse_ws(str(rv.get("evidence_quote") or ""))
+            hit = doc.find(ev) if ev and len(ev) >= 12 else None
+            if not hit:
+                continue
+            if rid.startswith("EC-") and rid[3:].isdigit() and 0 < int(rid[3:]) <= len(edge_cases):
+                e = edge_cases[int(rid[3:]) - 1]
+                answered_ec.add(int(rid[3:]) - 1)
+                where, prob = ", ".join(e.get("req_ids") or []) or "набор", "Сценарий: " + e["scenario"]
+            elif rid in qmap:
+                answered_q.add(rid)
+                where, prob = qmap[rid][0].id, "Вопрос: " + qmap[rid][0].questions[qmap[rid][1]]
+            else:
+                continue
+            dropped.append({"_old": rid, "_index": index, "where": where, "problem": prob,
+                            "reason": collapse_ws(str(rv.get("reason") or "")) or "Уже описано в документе.",
+                            "evidence": f"{doc.location(hit[1], hit[2])} — «{hit[0]}»"})
+            continue
+        if rid not in index:
             continue
         r, f = index[rv["id"]]
         verdict = str(rv.get("verdict", "keep")).lower()
         reason = collapse_ws(str(rv.get("reason") or ""))
         if verdict == "drop":
             ev = collapse_ws(str(rv.get("evidence_quote") or ""))
-            hit = doc.find(ev) if ev else None
-            # отклоняем только с дословным доказательством из документа; стандартные поля шаблона —
-            # допускаем отклонение без цитаты, если дефект MINOR/MAJOR по критерию APP
+            hit = doc.find(ev) if ev and len(ev) >= 12 else None
+            # отклоняем только с дословным доказательством из ДРУГОГО места документа: строка самого дефекта
+            # не может опровергнуть пропуск или неоднозначность в ней же. Стандартные поля шаблона (APP, не
+            # CRITICAL) допускаем отклонять без цитаты. CRITICAL отклоняем, только если доказательство длиннее
+            # формального совпадения (не менее 25 символов).
+            own = _lines_of(f)
+            if hit and set(range(hit[1], hit[2] + 1)) <= own:
+                hit = None
+            if hit and f.severity == "critical" and len(ev) < 25:
+                hit = None
             if hit or (f.criterion == "APP" and f.severity != "critical"):
-                dropped.append({"id": f.fid, "where": (r.id if r else ", ".join(f.req_ids[:5])),
+                dropped.append({"_old": f.fid, "_index": index, "where": (r.id if r else ", ".join(f.req_ids[:5])),
                                 "problem": f.problem, "reason": reason,
                                 "evidence": f"{doc.location(hit[1], hit[2])} — «{hit[0]}»" if hit else ""})
                 f._dropped = True
@@ -99,6 +177,13 @@ def critic(doc, reqs, set_findings, llm, doc_text: str, prompts_mod, warnings: l
         r.findings = [f for f in r.findings if not getattr(f, "_dropped", False)]
         r.linked = [f for f in r.linked if not getattr(f, "_dropped", False)]
     set_findings[:] = [f for f in set_findings if not getattr(f, "_dropped", False)]
+    edge_cases[:] = [e for i, e in enumerate(edge_cases) if i not in answered_ec]
+    drop_q = {}
+    for k in answered_q:
+        r, j = qmap[k]
+        drop_q.setdefault(r.id, (r, set()))[1].add(j)
+    for r, js in drop_q.values():
+        r.questions = [q for j, q in enumerate(r.questions) if j not in js]
     if dropped or changed:
         warnings.append(f"Самопроверка LLM-ревьюером: отклонено ложных срабатываний — {len(dropped)}, "
                         f"скорректировано (критичность/критерий/формулировка) — {changed}.")
@@ -191,8 +276,7 @@ def acceptance_gaps(reqs, trace, finding_cls):
         missing.append(r)
     if not missing:
         return None
-    quotes = [short(r.text, 90).rstrip("…") for r in missing]
-    quotes = [q if q in r.text else r.text for q, r in zip(quotes, missing)]
+    quotes = [r.text for r in missing]
     return finding_cls(
         criterion="S-COMPL", severity="major", type="Пропуск", tag="ACCEPTANCE", source="правило",
         problem=f"Для {len(missing)} правил нет ни одного критерия приёмки (по матрице прослеживаемости): "
@@ -274,3 +358,120 @@ def explain_critical(doc, reqs, set_findings, llm, doc_text: str, prompts_mod, w
     if cov:
         cov.check("why", title, "выполнена" if got or not crit else "не выполнена",
                   "" if got else "модель не вернула обоснований")
+
+
+# ------------------------------------------------------------------ согласованность отметок
+def align_marks(reqs, edge_cases) -> int:
+    """Отметки требования не должны противоречить найденным дефектам:
+    — требование затронуто системным дефектом → соответствующий критерий не может быть «выполнен»;
+    — по требованию есть открытый пограничный сценарий → «Полнота» не выше «замечания»."""
+    rank = {"na": 0, "ok": 1, "warn": 2, "fail": 3}
+    changed = 0
+
+    def bump(r, c, st, why):
+        nonlocal changed
+        if rank[st] > rank.get(r.criteria.get(c, "na"), 0):
+            r.criteria[c] = st
+            if not r.comments.get(c):
+                r.comments[c] = why
+            changed += 1
+
+    for r in reqs:
+        for f in r.linked:
+            c = SET_TO_IND.get(f.criterion)
+            if c:
+                bump(r, c, "fail" if f.severity == "critical" else "warn",
+                     f"Затронуто системным дефектом {f.fid or ''}".strip() + ".")
+    by_id = {r.id: r for r in reqs}
+    for i, e in enumerate(edge_cases, 1):
+        for rid in e.get("req_ids") or []:
+            r = by_id.get(rid)
+            if r is not None:
+                bump(r, "COM", "warn", f"Не описан пограничный сценарий EC-{i:02d}.")
+    return changed
+
+
+# ------------------------------------------------------------------ ссылки на строки и цитаты в тексте
+_REF = re.compile(r"\[L(\d+)(?:\s*[–-]\s*L?(\d+))?\]")
+_QUOTE = re.compile(r"«([^«»]{6,300})»")
+
+
+def _fix_text(doc, text: str, near: tuple[int, int] | None, stat: dict) -> str:
+    if not text:
+        return text
+    lines = doc.by_gid
+
+    # 1) цитаты «…»: дословный текст документа вместо слегка искажённого (опечатки модели)
+    def fix_q(m):
+        q = m.group(1)
+        if doc.find(q):
+            return m.group(0)
+        hit = doc.find(q, near) if near else None
+        if hit and hit[0] and hit[0] != q and len(hit[0]) <= len(q) * 1.5 + 10:
+            stat["quotes"] += 1
+            return f"«{hit[0]}»"
+        return m.group(0)
+    text = _QUOTE.sub(fix_q, text)
+
+    # 2) [Lnn]: строка должна существовать, быть непустой и содержать цитату из того же предложения
+    def fix_ref(m):
+        a = int(m.group(1))
+        b = int(m.group(2)) if m.group(2) else a
+        s0 = max(text.rfind(". ", 0, m.start()), text.rfind("; ", 0, m.start())) + 1
+        e0 = min([x for x in (text.find(". ", m.end()), text.find("; ", m.end())) if x >= 0] or [len(text)])
+        quotes = _QUOTE.findall(text[s0:e0])
+        rng = range(min(a, b), max(a, b) + 1)
+        if quotes:
+            hits = [doc.find(q, near) for q in quotes]
+            hits = [h for h in hits if h]
+            if hits and not any(set(range(h[1], h[2] + 1)) & set(rng) for h in hits):
+                h = min(hits, key=lambda h: abs(h[1] - a))
+                stat["refs"] += 1
+                return f"[L{h[1]}]" if h[1] == h[2] else f"[L{h[1]}–L{h[2]}]"
+        if not any(lines.get(g) is not None and lines[g].text.strip() for g in rng):
+            stat["refs_removed"] += 1
+            return ""
+        return m.group(0)
+    return _REF.sub(fix_ref, text)
+
+
+def fix_references(doc, reqs, set_findings, edge_cases) -> dict:
+    """Перепроверяет ссылки [Lnn] и цитаты «…» в тексте дефектов: ссылка на пустую строку или на строку, где нет
+    цитируемого текста, исправляется по найденной цитате или удаляется; искажённая цитата заменяется дословной."""
+    stat = {"refs": 0, "refs_removed": 0, "quotes": 0}
+    for f in [f for r in reqs for f in r.findings] + set_findings:
+        near = (f.g1, f.g2 if f.g2 is not None else f.g1) if f.g1 is not None else None
+        f.problem = _fix_text(doc, f.problem, near, stat)
+        f.recommendation = _fix_text(doc, f.recommendation, near, stat)
+        f.also = [_fix_text(doc, a, near, stat) for a in (getattr(f, "also", None) or [])]
+        if getattr(f, "why", None):
+            f.why = {k: _fix_text(doc, v, near, stat) if isinstance(v, str) else v for k, v in f.why.items()}
+        if getattr(f, "caveat", None):
+            f.caveat = _fix_text(doc, f.caveat, near, stat)
+    for r in reqs:
+        near = (r.g1, r.g2)
+        r.comments = {k: _fix_text(doc, v, near, stat) for k, v in r.comments.items()}
+        r.questions = [_fix_text(doc, q, near, stat) for q in r.questions]
+        r.test_ideas = [_fix_text(doc, q, near, stat) for q in r.test_ideas]
+    for e in edge_cases:
+        for k in ("scenario", "risk", "question"):
+            e[k] = _fix_text(doc, e.get(k) or "", None, stat)
+    return stat
+
+
+def fill_quotes(doc, set_findings) -> int:
+    """У каждого места дефекта должна быть цитата: пустую цитату заменяем текстом строки документа."""
+    n = 0
+    for f in set_findings:
+        if len(f.quotes) != len(f.locs):
+            continue
+        for i, ((a, b), q) in enumerate(zip(f.locs, f.quotes)):
+            if q and q.strip():
+                continue
+            txt = " ".join(doc.by_gid[g].text.strip() for g in range(a, (b or a) + 1)
+                           if doc.by_gid.get(g) is not None and doc.by_gid[g].text.strip())
+            if txt:
+                f.quotes[i] = collapse_ws(txt)
+                n += 1
+        f.quote = " … ".join(f"«{q}»" for q in f.quotes if q)
+    return n

@@ -363,6 +363,28 @@ def _covered(rule: dict, findings: list[Finding]) -> bool:
     return False
 
 
+_ASSUME = re.compile(r"при условии|предполага|допуская|если .{0,40}ещё не|если .{0,40}еще не|assuming", re.I)
+RULE_KINDS = ("бизнес-правило", "функциональное", "ограничение", "данные", "нефункциональное")
+MAX_PAIRS = 45
+
+
+def rule_matrix(reqs: list[Requirement]) -> tuple[list[dict], list[dict]]:
+    """Пары нормативных правил и критерии приёмки, по которым модель ОБЯЗАНА дать вердикт (ничего не пропустить)."""
+    rules_ = [r for r in reqs if any(k in (r.kind or "").lower() for k in RULE_KINDS)]
+    acc = [r for r in reqs if "приём" in (r.kind or "").lower() or "прием" in (r.kind or "").lower()]
+    pairs = []
+    for i, a in enumerate(rules_):
+        for b in rules_[i + 1:]:
+            pairs.append((similarity(a.text, b.text), a, b))
+    if len(pairs) > MAX_PAIRS:
+        pairs.sort(key=lambda x: -x[0])
+        pairs = pairs[:MAX_PAIRS]
+    out = [{"id": f"P{n:02d}", "req_ids": [a.id, b.id], "a": short(a.text, 220), "b": short(b.text, 220)}
+           for n, (_, a, b) in enumerate(pairs, 1)]
+    acc_out = [{"id": f"A{n:02d}", "req_ids": [r.id], "criterion": short(r.text, 260)} for n, r in enumerate(acc, 1)]
+    return out, acc_out
+
+
 def review_set(doc: Document, reqs: list[Requirement], llm, warnings: list[str], cov: Coverage | None = None):
     if doc.char_count() <= SET_FULL_DOC_CHARS:
         doc_text = doc.numbered()
@@ -410,10 +432,13 @@ def review_set(doc: Document, reqs: list[Requirement], llm, warnings: list[str],
     log("[3/5] Проверка набора требований (3/3: сценарный анализ противоречий между правилами)…")
     known = [f"{', '.join(f.req_ids)}: {short(f.problem, 160)}" for f in findings if f.criterion == "S-CONS"]
     tests = [f"{r.id}: {t}" for r in reqs for t in r.test_ideas]
+    pairs, accept = rule_matrix(reqs)
+    assumed = [t for t in tests if _ASSUME.search(t)]
     try:
         data = llm.generate_json("set_conflicts", prompts.SYSTEM,
-                                 prompts.conflicts_prompt(doc.title, doc_text, rl, hints, known, tests),
-                                 {"requirements": rl})
+                                 prompts.conflicts_prompt(doc.title, doc_text, rl, hints, known, tests,
+                                                          pairs, accept, assumed),
+                                 {"requirements": rl, "pairs": pairs, "acceptance": accept})
         if cov:
             cov.check("set_conflicts", "Набор: сценарный анализ противоречий", "выполнена")
     except LLMError as e:
@@ -435,6 +460,37 @@ def review_set(doc: Document, reqs: list[Requirement], llm, warnings: list[str],
             c.setdefault("criterion", "S-CONS")
             c["tag"] = c.get("tag") or "CONTRADICTION"
             conf.append(c)
+        # обязательная матрица: вердикт по КАЖДОЙ паре правил и КАЖДОМУ критерию приёмки
+        pmap = {p["id"]: p for p in pairs}
+        amap = {a["id"]: a for a in accept}
+        covered_pairs = {frozenset(c.get("requirement_ids") or []) for c in conf}
+        answered = 0
+        for x in (data.get("pairs") or []) + (data.get("acceptance") or []):
+            if not isinstance(x, dict):
+                continue
+            item = pmap.get(str(x.get("id"))) or amap.get(str(x.get("id")))
+            if item is None:
+                continue
+            answered += 1
+            verdict = str(x.get("verdict", "")).lower()
+            if verdict not in ("conflict", "priority-unclear"):
+                continue
+            ids = item["req_ids"]
+            if frozenset(ids) in covered_pairs:
+                continue
+            covered_pairs.add(frozenset(ids))
+            conf.append({"requirement_ids": ids, "quotes": [by_id[i].text for i in ids],
+                         "problem": collapse_ws(" ".join(t for t in (
+                             str(x.get("problem") or "Правила дают разный результат в одном сценарии."),
+                             f"Сценарий: {x['scenario']}" if x.get("scenario") else "",
+                             f"Результат: {x['outcomes']}" if x.get("outcomes") else "") if t)),
+                         "recommendation": collapse_ws(str(x.get("recommendation") or
+                                                           "Явно указать, какое правило имеет приоритет в этом сценарии.")),
+                         "severity": "critical" if verdict == "conflict" else "major", "type": "Противоречие",
+                         "criterion": "S-CONS", "tag": "CONTRADICTION"})
+        if pairs or accept:
+            warnings.append(f"Матрица сценариев: модель дала вердикт по {answered} из {len(pairs) + len(accept)} "
+                            "пар правил и критериев приёмки.")
         findings += _set_findings_from({"findings": conf}, doc, by_id, counters)
         for b in data.get("bad_test_ideas") or []:
             if not isinstance(b, dict):
@@ -553,7 +609,7 @@ def run(doc: Document, llm, batch_size: int = 8) -> Result:
     if acc is not None:
         set_findings.append(acc)
     log("[4/5] Объединение дефектов по первопричине…")
-    set_findings, cstats = consolidate(reqs, set_findings, Finding)
+    set_findings, cstats = consolidate(reqs, set_findings, Finding, section_of=doc.section_of)
     if cstats["merged"]:
         warnings.append(f"Объединено {cstats['merged']} повторных замечаний с общей первопричиной: каждый дефект "
                         "показан один раз со списком всех мест, где он проявляется.")
@@ -564,16 +620,26 @@ def run(doc: Document, llm, batch_size: int = 8) -> Result:
     # самопроверка: LLM-ревьюер второго уровня + детерминированные проверки отчёта
     log("[4/5] Самопроверка: ревьюер второго уровня ищет ложные срабатывания…")
     doc_text = doc.numbered() if doc.char_count() <= SET_FULL_DOC_CHARS else doc.headings_outline()
-    dropped = verify.critic(doc, reqs, set_findings, llm, doc_text, prompts, warnings, cov)
+    dropped = verify.critic(doc, reqs, set_findings, llm, doc_text, prompts, warnings, cov,
+                             edge_cases=edge_cases)
     checks["sanitized"] = verify.sanitize(doc, [f for r in reqs for f in r.findings] + set_findings)
     for r in reqs:
         r.findings.sort(key=lambda f: (SEVERITY_ORDER[f.severity], list(INDIVIDUAL).index(f.criterion)))
     set_findings.sort(key=lambda f: (SEVERITY_ORDER[f.severity], -len(f.locs)))
     _link_systemic(reqs, set_findings)
     _number(reqs, set_findings)
+    verify.restamp_dropped(dropped)
     checks["post"] = verify.self_check(doc, reqs, set_findings, Finding, final=True)
+    checks["marks_aligned"] = verify.align_marks(reqs, edge_cases)
     checks["ocr_guard"] = verify.ocr_guard(doc, [f for r in reqs for f in r.findings] + set_findings)
     verify.explain_critical(doc, reqs, set_findings, llm, doc_text, prompts, warnings, cov)
+    verify.fill_quotes(doc, set_findings)
+    refs = verify.fix_references(doc, reqs, set_findings, edge_cases)
+    checks["references"] = refs
+    if any(refs.values()):
+        warnings.append(f"Проверка ссылок в тексте дефектов: исправлено ссылок на строки — {refs['refs']}, "
+                        f"удалено ссылок на пустые строки — {refs['refs_removed']}, цитат приведено к дословному "
+                        f"тексту — {refs['quotes']}.")
     if checks["sanitized"]:
         warnings.append(f"В {checks['sanitized']} рекомендациях значения, отсутствующие в документе (URL/пути), "
                         "заменены на «<указать …>».")
@@ -610,7 +676,15 @@ def run(doc: Document, llm, batch_size: int = 8) -> Result:
         "unverified": sum(1 for f in all_f if not f.verified and f.source == "LLM"),
         "rule_findings": sum(1 for f in all_f if f.source == "правило"),
         "mock": llm.model == "mock",
+        "model_usage": dict(getattr(llm, "used", {}) or {}),
+        "primary_model": getattr(llm, "primary", None) if hasattr(llm, "primary_share") else None,
     }
+    share = llm.primary_share() if hasattr(llm, "primary_share") else None
+    stats["primary_share"] = round(share, 2) if share is not None else None
+    if share is not None and share < 0.5:
+        warnings.append(f"Основная модель {stats['primary_model']} обработала только {round(share * 100)}% запросов "
+                        "(остальные — резервные модели из-за перегрузки сервиса): качество анализа может быть ниже; "
+                        "рекомендуется повторный запуск.")
     csum = cov.summary()
     status, reasons = run_status(doc.ingest, csum, len(reqs), sum(1 for r in reqs if r.reviewed), llm.model == "mock")
     stats["affected_reqs"] = stats["with_issues"]

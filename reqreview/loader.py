@@ -72,7 +72,7 @@ class Document:
             item = _item_label(ln.text) if not ln.is_heading else ""
             if item and stack:
                 head = _item_label(stack[-1][1])
-                if head and head != item:
+                if head and head != item and _same_shape(head, item):
                     parent = next((t for lv, t in reversed(stack[:-1])), "")
                     if parent:
                         self.misplaced.append((ln.gid, item, stack[-1][1], parent))
@@ -256,6 +256,15 @@ def _item_label(t: str) -> str:
     """Метка пункта: «**401.** …» → «401», «**Ф-1.** …» → «Ф-1»; для заголовка «200. Successful» → «200»."""
     m = _ITEM_RE.match(t) or _HEAD_LABEL_RE.match(t.lstrip("#").strip() + " ")
     return m.group(1) if m else ""
+
+
+def _same_shape(a: str, b: str) -> bool:
+    """Метки одного вида: обе числовые одной длины (200 и 401) или с одинаковым буквенным префиксом (Ф-1 и Ф-2).
+    Номер главы «2» и требование «КБ-1» — разные виды, это не аномалия структуры."""
+    if a.isdigit() and b.isdigit():
+        return len(a) == len(b)
+    pa, pb = re.match(r"[^\d]*", a).group(0), re.match(r"[^\d]*", b).group(0)
+    return bool(pa) and pa == pb
 
 
 def _heading_level(t: str) -> int:

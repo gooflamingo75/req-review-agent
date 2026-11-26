@@ -88,6 +88,10 @@ class ScriptedLLM:
                                    "quotes": ["получает кэшбэк 2%", "отображается в истории операций"],
                                    "scenario": "Оплата 10 000 ₸", "outcomes": "по A: 200; по B: иначе",
                                    "severity": "major", "problem": "Сценарный конфликт.", "recommendation": "r"}],
+                    "pairs": [{"id": p["id"], "verdict": "conflict" if n == 0 else "ok",
+                               "problem": "Матричный конфликт.", "scenario": "s", "outcomes": "o"}
+                              for n, p in enumerate(payload["pairs"])
+                              if set(p["req_ids"]) != {ids["КБ-1"], ids["КБ-4"]}],
                     "bad_test_ideas": [{"requirement_id": ids["КБ-1"], "test_idea": "10 000 → 200",
                                         "violates": [ids["КБ-3"]], "why": "лимит"}]}
         if task == "set_consistency":
@@ -137,7 +141,11 @@ def test_scripted_pipeline():
     assert not any(f.problem == "Выдумка" for f in res.set_findings), "непроверяемое замечание отброшено"
     assert res.set_criteria["S-CONS"]["status"] == "fail"
     assert any("Сценарий: Оплата" in f.problem for f in res.set_findings), "сценарный конфликт"
+    assert any("Матричный конфликт." in f.problem for f in res.set_findings), "вердикт матрицы пар правил"
+    assert any("Матрица сценариев" in w for w in res.warnings)
+    assert res.stats["model_usage"] == {} and "primary_share" in res.stats
     assert res.dropped and "Кэшбэк начисляется быстро" in res.dropped[0]["evidence"], "критик отклоняет с доказательством"
+    assert all(d["id"].startswith("D-") for d in res.dropped) and "_index" not in res.dropped[0]
     assert not any("КБ-5" in f.problem for f in res.set_findings)
     r2c = next(r for r in res.requirements if r.doc_id == "КБ-2")
     rec = next(f for f in r2c.findings if f.problem == "Нет срока начисления.").recommendation
@@ -184,6 +192,78 @@ def test_document_rules_generic(tmp_path=None):
         f.write(text)
     tags = {h["tag"] for h in check_document(load_document(f.name))}
     assert {"UNITS", "REST-METHOD", "STATUS-200", "SECTION-EMPTY"} <= tags, tags
+
+
+def _tmpdoc(text):
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8") as f:
+        f.write(text)
+    return load_document(f.name)
+
+
+def test_data_type_and_nfr_rules():
+    """Поле с разными типами в таблицах запроса и ответа; срок без перцентиля — универсальные правила."""
+    from reqreview.rules import check_document, check_requirement
+    doc = _tmpdoc("\n".join([
+        "# Заказ", "## Запрос", "| Поле | Тип | Описание |", "| --- | --- | --- |",
+        "| `qty` | integer | Количество |", "| `note` | string | Комментарий |", "",
+        "## Ответ", "| Name | Format |", "| :--- | :--- |", "| qty | string |", "| note | string |"]))
+    hits = [h for h in check_document(doc) if h["tag"] == "DATA-TYPE"]
+    assert len(hits) == 1 and "«qty»" in hits[0]["problem"] and "note" not in hits[0]["problem"]
+    assert {g for g, _ in hits[0]["locs"]} == {5, 11}
+    assert [h["tag"] for h in check_requirement("Отчёт формируется не более 3 секунд.")] == ["NFR-METRIC"]
+    assert check_requirement("Отчёт формируется не более 3 секунд для 95% запросов.") == []
+
+
+def test_critic_needs_other_line_evidence_and_answers_edge_cases():
+    from reqreview import prompts, verify
+    from reqreview.agent import Finding, Requirement
+    doc = _tmpdoc("# T\n\nСистема отправляет письмо.\n\nПисьмо отправляется на адрес из профиля клиента.\n")
+    r = Requirement(id="REQ-01", doc_id=None, text="Система отправляет письмо.", summary="", kind="функциональное",
+                    g1=3, g2=3, questions=["На какой адрес отправляется письмо?"])
+    f1 = Finding(criterion="COM", severity="major", problem="Не указан адрес.", recommendation="",
+                 quote="Система отправляет письмо.", g1=3, g2=3, req_ids=["REQ-01"], fid="F-001")
+    f2 = Finding(criterion="UNA", severity="major", problem="Неясно что за письмо.", recommendation="",
+                 quote="Система отправляет письмо.", g1=3, g2=3, req_ids=["REQ-01"], fid="F-002")
+    r.findings = [f1, f2]
+    ec = [{"scenario": "Адрес не указан", "req_ids": ["REQ-01"], "risk": "", "question": ""}]
+
+    class L:
+        model = "x"
+
+        def generate_json(self, *a, **k):
+            return {"reviews": [
+                {"id": "F-001", "verdict": "drop", "reason": "см. F-002",
+                 "evidence_quote": "Письмо отправляется на адрес из профиля клиента"},
+                {"id": "F-002", "verdict": "drop", "reason": "своя строка",
+                 "evidence_quote": "Система отправляет письмо"},
+                {"id": "Q-01", "verdict": "drop", "evidence_quote": "на адрес из профиля клиента"},
+                {"id": "EC-01", "verdict": "drop", "evidence_quote": "на адрес из профиля клиента"}]}
+    dropped = verify.critic(doc, [r], [], L(), doc.numbered(), prompts, [], edge_cases=ec)
+    assert [f.fid for f in r.findings] == ["F-002"], "цитата из строки самого дефекта не опровергает его"
+    assert ec == [] and r.questions == []
+    r.findings[0].fid = "F-001"                  # перенумерация после самопроверки
+    verify.restamp_dropped(dropped)
+    assert [d["id"] for d in dropped] == ["D-01", "D-02", "D-03"]
+    assert "F-001" in dropped[0]["reason"], "ссылка на живой дефект — его итоговый номер"
+
+
+def test_fix_references_and_marks():
+    from reqreview import verify
+    from reqreview.agent import Finding, Requirement
+    doc = _tmpdoc("# T\n\nСумма передаётся в тенге.\n\nСрок хранения — пять лет.\n")
+    f = Finding(criterion="S-CONS", severity="critical", problem="В [L3] сказано «Срок хранения — пять лет»; "
+                "пустая строка [L4]. Цитата с опечаткой «Сумма передаеться в тенге».", recommendation="",
+                g1=3, g2=3, req_ids=["REQ-01"], fid="S-01", locs=[(3, 3)], quotes=[""])
+    st = verify.fix_references(doc, [], [f], [])
+    assert "[L5]" in f.problem and "[L4]" not in f.problem and "«Сумма передаётся в тенге»" in f.problem, f.problem
+    assert st["refs"] == 1 and st["refs_removed"] == 1 and st["quotes"] == 1
+    assert verify.fill_quotes(doc, [f]) == 1 and f.quotes == ["Сумма передаётся в тенге."]
+    r = Requirement(id="REQ-01", doc_id=None, text="x", summary="", kind="", g1=3, g2=3,
+                    criteria={"CON": "ok", "COM": "ok"})
+    r.linked = [f]
+    verify.align_marks([r], [{"scenario": "s", "req_ids": ["REQ-01"]}])
+    assert r.criteria == {"CON": "fail", "COM": "warn"}
 
 
 if __name__ == "__main__":

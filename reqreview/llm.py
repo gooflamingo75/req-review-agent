@@ -38,8 +38,10 @@ def log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
-DEFAULT_GEMINI_FALLBACKS = ["gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite",
-                            "gemini-flash-latest", "gemini-flash-lite-latest"]
+# Порядок важен: сначала полноценные flash-модели, облегчённые «lite» — только в крайнем случае
+DEFAULT_GEMINI_FALLBACKS = ["gemini-3.6-flash", "gemini-flash-latest", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite",
+                            "gemini-flash-lite-latest"]
+OVERLOAD_RETRIES_PRIMARY = 4    # столько раз подряд ждём основную модель при перегрузке (503), прежде чем уйти на резерв
 
 
 class GeminiLLM:
@@ -61,6 +63,7 @@ class GeminiLLM:
         chain = [model] + list(DEFAULT_GEMINI_FALLBACKS if fallbacks is None else fallbacks)
         self.models = list(dict.fromkeys(m.strip() for m in chain if m and m.strip()))
         self._idx = 0
+        self.dead: set[str] = set()          # модели, недоступные до конца прогона (404, дневной лимит)
         self.min_interval = min_interval
         self.max_retries = max_retries
         self.temperature = temperature
@@ -86,13 +89,29 @@ class GeminiLLM:
             time.sleep(self.min_interval - dt)
         self._last = time.monotonic()
 
-    def _switch(self, reason: str) -> bool:
-        if self._idx + 1 >= len(self.models):
-            return False
+    def _switch(self, reason: str, permanent: bool = False) -> bool:
         old = self.model
-        self._idx += 1
-        log(f"   ! модель {old} {reason} — переключаюсь на резервную {self.model}")
+        if permanent:
+            self.dead.add(old)
+        nxt = next((i for i in range(self._idx + 1, len(self.models)) if self.models[i] not in self.dead), None)
+        if nxt is None:
+            return False
+        self._idx = nxt
+        log(f"   ! модель {old} {reason} — {'переключаюсь' if permanent else 'для этого запроса использую'} "
+            f"резервную {self.model}")
         return True
+
+    def _reset(self):
+        """Каждый новый запрос сначала пробует основную модель (если она не выбыла насовсем)."""
+        self._idx = next((i for i, m in enumerate(self.models) if m not in self.dead), len(self.models) - 1)
+
+    @property
+    def primary(self) -> str:
+        return self.models[0]
+
+    def primary_share(self) -> float | None:
+        total = sum(self.used.values())
+        return (self.used.get(self.primary, 0) / total) if total else None
 
     def _raw(self, system: str, prompt: str) -> str:
         types = self._types
@@ -101,8 +120,9 @@ class GeminiLLM:
             temperature=self.temperature,
             response_mime_type="application/json",
         )
+        self._reset()
         delay, attempt, overloaded, last_err = 10.0, 0, 0, ""
-        while attempt < self.max_retries * 2:
+        while attempt < self.max_retries * 3:
             attempt += 1
             self._wait_turn()
             try:
@@ -120,21 +140,22 @@ class GeminiLLM:
                 if code in (401, 403) or "API_KEY_INVALID" in msg or "PERMISSION_DENIED" in msg:
                     raise LLMError(f"Ключ отклонён ({code}). Проверьте GEMINI_API_KEY в .env. {msg[:300]}") from e
                 if code == 404 or (code == 400 and "model" in msg.lower() and "not" in msg.lower()):
-                    if self._switch("недоступна (404)"):
+                    if self._switch("недоступна (404)", permanent=True):
                         overloaded = 0
                         continue
                     raise LLMError(f"Ни одна из моделей {', '.join(self.models)} не доступна. {msg[:200]}") from e
                 if code == 400:
                     raise LLMError(f"Запрос отклонён (400): {msg[:300]}") from e
                 if code == 429 and "PerDay" in msg:
-                    if self._switch("исчерпала дневной лимит бесплатного тарифа"):
+                    if self._switch("исчерпала дневной лимит бесплатного тарифа", permanent=True):
                         overloaded = 0
                         continue
                     raise LLMError("Исчерпан дневной лимит бесплатного тарифа Gemini на всех моделях. "
                                    "Попробуйте позже.") from e
                 if code in (500, 502, 503, 504) or isinstance(e, LLMError):
                     overloaded += 1
-                    if overloaded >= 2 and self._switch(f"перегружена ({code})"):
+                    limit = OVERLOAD_RETRIES_PRIMARY if self._idx == 0 else 2
+                    if overloaded >= limit and self._switch(f"перегружена ({code})"):
                         overloaded = 0
                         delay = 10.0
                         continue

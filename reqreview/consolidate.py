@@ -113,13 +113,37 @@ def _normalize_set(f) -> None:
         f.quotes = (f.quotes + [q] * len(f.locs))[: len(f.locs)]
 
 
+# «Оформительские» теги: одна метка, но разные места документа — это разные дефекты
+LOCAL_TAGS = {"PLACEHOLDER", "SECTION-EMPTY", "STRUCTURE", "APPROVALS"}
+_SECTION_OF = None
+
+
+def _sections(f) -> set:
+    if _SECTION_OF is None:
+        return set()
+    return {_SECTION_OF(a) for a, _ in f.locs}
+
+
 def _same_root(a, b) -> bool:
     ta, tb = _tag(a), _tag(b)
-    if ta and ta == tb and ta in SYSTEMIC_TAGS:
-        return True
     shared_req = bool(set(a.req_ids) & set(b.req_ids))
     shared_loc = bool({x for x, _ in a.locs} & {x for x, _ in b.locs})
     sim = similarity(a.problem, b.problem)
+    if ta and ta == tb and ta in SYSTEMIC_TAGS:
+        if ta not in LOCAL_TAGS:
+            return True
+        # один и тот же «оформительский» тег объединяем только в пределах одного раздела
+        sa, sb = _sections(a), _sections(b)
+        return shared_loc or bool(sa & sb) if (sa and sb) else (shared_loc or sim >= 0.5)
+    # противоречия между РАЗНЫМИ парами требований — разные дефекты, даже если описаны похожими словами
+    if "CONTRADICTION" in (ta, tb) or a.criterion == b.criterion == "S-CONS":
+        A, B = set(a.req_ids), set(b.req_ids)
+        if A and B and not (A <= B or B <= A):
+            return False
+    # одна и та же строка-источник и близкое описание — одна первопричина, даже если тег разный
+    # (например, «GET для сохранения» и «противоречие GET и изменения состояния»)
+    if shared_loc and sim >= 0.4:
+        return True
     if ta and ta == tb and (shared_req or shared_loc) and sim >= 0.35:
         return True
     if a.criterion == b.criterion and (shared_req or shared_loc) and sim >= 0.5:
@@ -127,8 +151,11 @@ def _same_root(a, b) -> bool:
     return sim >= 0.75
 
 
-def consolidate(reqs, set_findings, finding_cls):
-    """Возвращает (новый список замечаний к набору, статистика объединения)."""
+def consolidate(reqs, set_findings, finding_cls, section_of=None):
+    """Возвращает (новый список замечаний к набору, статистика объединения).
+    section_of(gid) — раздел документа для строки (чтобы не склеивать дефекты из разных разделов)."""
+    global _SECTION_OF
+    _SECTION_OF = section_of
     stats = {"before": sum(len(r.findings) for r in reqs) + len(set_findings)}
     for f in set_findings:
         f.merged = getattr(f, "merged", 0)
@@ -182,8 +209,10 @@ def consolidate(reqs, set_findings, finding_cls):
     for r in reqs:
         keep = []
         for f in r.findings:
-            host = next((m for m in merged if r.id in m.req_ids and
-                         similarity(f.problem, m.problem) >= 0.55), None)
+            fl = {f.g1} if f.g1 is not None else set()
+            host = next((m for m in merged if
+                         (r.id in m.req_ids and similarity(f.problem, m.problem) >= 0.55) or
+                         (fl & {a for a, _ in m.locs} and similarity(f.problem, m.problem) >= 0.35)), None)
             if host is not None:
                 _add_occurrence(host, f)
                 if host not in r.linked:

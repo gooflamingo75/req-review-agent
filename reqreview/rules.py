@@ -89,6 +89,14 @@ ID_RE = re.compile(r"^([A-Za-zА-Яа-яЁё]+(?:[-_.][A-Za-zА-Яа-яЁё]+)*)
 _compiled = [(re.compile(p, _I), c, e, s) for p, c, e, s in WORD_RULES]
 
 
+# ограничение по времени: «в течение минуты», «не более 2 секунд», «за 500 мс», «within 5 seconds»
+TIME_RE = re.compile(
+    r"\b(в\s+течение|не\s+более|не\s+дольше|до|за|within|in\s+under|under)\s+"
+    r"(\d+[\s,.]?\d*\s*)?(мс|миллисекунд\w*|сек\w*|с\b|минут\w*|мин\b|час\w*|ms|millisec\w*|sec\w*|minutes?|hours?)", _I)
+PERCENTILE_RE = re.compile(r"перцентил\w*|процентил\w*|\bp\d{2}\b|\d{2}(?:[.,]\d+)?\s*%|percentile|"
+                           r"в\s+\d+\s+из\s+\d+|при\s+нагрузке|под\s+нагрузкой|\bRPS\b|\bTPS\b", _I)
+
+
 def _context(text: str, start: int, end: int, words: int = 3) -> str:
     """Дословный фрагмент вокруг совпадения (±N слов) — для цитаты."""
     left = text[:start].split(" ")
@@ -136,6 +144,18 @@ def check_requirement(text: str) -> list[dict]:
             "recommendation": "Если это не обоснованное внешнее ограничение, сформулировать требуемое свойство, а не способ реализации; "
                               "иначе указать источник ограничения.",
         })
+    for m in TIME_RE.finditer(text):
+        if PERCENTILE_RE.search(text):
+            break
+        hits.append({
+            "criterion": "VER", "criteria": ["VER", "UNA"], "severity": "major", "trigger": m.group(0), "tag": "NFR-METRIC",
+            "quote": _context(text, m.start(), m.end()),
+            "problem": f"Ограничение по времени «{m.group(0)}» задано без доли запросов (перцентиля), "
+                       "условий нагрузки и точек начала/окончания измерения — непонятно, что именно и как измерять.",
+            "recommendation": "Указать перцентиль (например, 95% событий), нагрузку, точку начала и окончания "
+                              "отсчёта (что считается завершением — передача, доставка, получение) и способ замера.",
+        })
+        break
     modals = MODAL_RE.findall(text)
     if len(modals) >= 2:
         m2 = list(MODAL_RE.finditer(text))[1]
@@ -230,6 +250,40 @@ def _ctx_line(text: str, m: re.Match, words: int = 4) -> str:
     return _context(text, m.start(), m.end(), words)
 
 
+_NAME_COL = re.compile(r"^(parameter|param|field|name|attribute|параметр|поле|атрибут|наименование|имя)\w*$", _I)
+_TYPE_COL = re.compile(r"^(format|type|data\s*type|формат|тип(\s+данных)?)$", _I)
+
+
+def _cells(text: str) -> list[str] | None:
+    t = text.strip()
+    if not (t.startswith("|") and t.endswith("|")) or t.count("|") < 3:
+        return None
+    return [c.strip().strip("`*").strip() for c in t[1:-1].split("|")]
+
+
+def _param_rows(lines) -> list[tuple[str, str, object]]:
+    """Строки таблиц, у которых есть колонка имени поля и колонка типа/формата:
+    (имя поля, нормализованный тип, строка)."""
+    out, cols = [], None
+    for ln in lines:
+        cells = _cells(ln.text)
+        if cells is None:
+            cols = None
+            continue
+        if all(re.fullmatch(r":?-{2,}:?", c) for c in cells if c):
+            continue
+        ni = next((i for i, c in enumerate(cells) if _NAME_COL.match(c)), None)
+        ti = next((i for i, c in enumerate(cells) if _TYPE_COL.match(c)), None)
+        if ni is not None and ti is not None:
+            cols = (ni, ti)
+            continue
+        if cols and len(cells) > max(cols):
+            name, fmt = cells[cols[0]], cells[cols[1]].lower()
+            if name and fmt and fmt not in {"—", "-"} and len(name) <= 64:
+                out.append((name, fmt, ln))
+    return out
+
+
 def check_document(doc) -> list[dict]:
     """Детерминированные проверки по всему тексту документа (единицы измерения, HTTP-семантика,
     заглушки шаблона). Возвращает замечания к набору с дословными цитатами и строками."""
@@ -309,7 +363,7 @@ def check_document(doc) -> list[dict]:
     if len(yn) >= 3:
         out.append({
             "type": "Незаполненный раздел", "criterion": "S-COMPL", "severity": "minor", "tag": "PLACEHOLDER",
-            "locs": [(yn[0].gid, collapse(yn[0].text)[:160])],
+            "locs": [(yn[0].gid, collapse(yn[0].text))],
             "problem": f"Чек-лист ревью не заполнен: в {len(yn)} строках оставлены варианты «Да / Нет» без отметки — "
                        "ревью требований формально не проведено.",
             "recommendation": "Провести ревью и проставить отметки «Да»/«Нет»/«Не требуется» с примечаниями.",
@@ -327,7 +381,7 @@ def check_document(doc) -> list[dict]:
     for ln, m in dash[:2]:
         out.append({
             "type": "Незаполненный раздел", "criterion": "S-COMPL", "severity": "minor", "tag": "PLACEHOLDER",
-            "locs": [(ln.gid, collapse(ln.text)[:160])],
+            "locs": [(ln.gid, collapse(ln.text))],
             "problem": "Параметр спецификации не заполнен (стоит «—»).",
             "recommendation": "Указать значение или явно отметить «не применяется» с причиной.",
         })
@@ -349,13 +403,36 @@ def check_document(doc) -> list[dict]:
         ln0 = next(ln for ln in lines if ln.gid == items[0][0])
         out.append({
             "type": "Структура", "criterion": "S-COMP", "severity": "minor", "tag": "STRUCTURE",
-            "locs": [(g, collapse(next(ln.text for ln in lines if ln.gid == g))[:120]) for g, _ in items],
+            "locs": [(g, collapse(next(ln.text for ln in lines if ln.gid == g))) for g, _ in items],
             "problem": (f"Пункты {', '.join('«' + i + '»' for _, i in items)} размещены" if len(items) > 1
                         else f"Пункт «{items[0][1]}» размещён") + f" под заголовком «{head}», "
                        "который относится к другому пункту, — читатель может отнести их описание не к тому разделу.",
             "recommendation": "Вынести каждый пункт под собственный заголовок или в общий раздел-перечень.",
         })
         del ln0
+
+    # 4в. Одно и то же поле в разных таблицах параметров с разным типом/форматом
+    seen_fmt: dict[str, list] = {}
+    for name, fmt, ln in _param_rows(lines):
+        seen_fmt.setdefault(name, []).append((fmt, ln))
+    bad = []
+    for name, rows in seen_fmt.items():
+        if len({f for f, _ in rows}) >= 2:
+            bad.append((name, rows[0], next(r for r in rows if r[0] != rows[0][0])))
+    if bad:
+        locs, parts = [], []
+        for name, (f1, l1), (f2, l2) in bad[:4]:
+            locs += [(l1.gid, collapse(l1.text)), (l2.gid, collapse(l2.text))]
+            parts.append(f"«{name}»: {f1} и {f2}")
+        out.append({
+            "type": "Несогласованность", "criterion": "S-CONS", "severity": "major", "tag": "DATA-TYPE",
+            "locs": locs,
+            "problem": "Одни и те же поля описаны с разными типами в разных таблицах параметров ("
+                       + "; ".join(parts) + "). Клиент и сервер могут по-разному сериализовать и проверять "
+                       "значения (например, число и строка).",
+            "recommendation": "Зафиксировать один тип и формат каждого поля для всех мест (запрос, ответ, хранение) "
+                              "или явно описать преобразование между ними.",
+        })
 
     # 5. Заголовок Content-Type при отсутствии тела
     ct = find(r"Content-Type[^a-z]*application/json")

@@ -502,6 +502,10 @@ def _executive(v: View, o: Out):
         (f"{pct:.0f}%" if pct is not None else "—", "текста проверено", "посчитано кодом", ""),
         (st_label, "статус проверки", "см. «Объём проверки»", "crit" if st_cls == "fail" else ""),
     ])
+    share = s.get("primary_share")
+    if share is not None and share < 0.5:
+        o.callout(f"Основная модель обработала только {round(share * 100)}% запросов (остальные — резервные модели "
+                  "из-за перегрузки сервиса). Глубина анализа может быть ниже; рекомендуется повторный запуск.", "warn")
     crit = v.by_sev("CRITICAL")
     if crit:
         groups = v.root_groups(crit)
@@ -563,13 +567,27 @@ def _dropped_count(v: View) -> int:
     return 0
 
 
+def _model_line(v: View) -> str:
+    st = v.d.get("stats") or {}
+    used = st.get("model_usage") or {}
+    if not used:
+        return v.d.get("model", "—")
+    total = sum(used.values())
+    parts = ", ".join(f"{m} — {n}" for m, n in sorted(used.items(), key=lambda x: -x[1]))
+    line = f"{v.d.get('model', '—')} (запросов: {total}; по моделям: {parts})"
+    share = st.get("primary_share")
+    if share is not None and share < 0.5:
+        line += f". Основная модель обработала только {round(share * 100)}% запросов — рекомендуется повторный запуск"
+    return line
+
+
 def _passport(v: View, o: Out):
     doc = v.d.get("document") or {}
     ing = v.ing
     o.h(2, "1. Паспорт прогона", "passport")
     o.kv([("Документ", f"«{doc.get('title', '')}» · `{doc.get('file', '')}`"),
           ("Дата и время прогона", (v.d.get("date") or "").replace("T", " ")),
-          ("Модель", v.d.get("model", "—")),
+          ("Модель", _model_line(v)),
           ("Версия агента", v.d.get("agent_version", "—")),
           ("Время анализа", f"{v.d.get('duration_sec', 0):.0f} сек"),
           ("SHA-256 документа", f"`{doc.get('sha256', '')}`"),
@@ -814,9 +832,18 @@ def _verdict(v: View, o: Out):
             + ", ".join(v.flink(f["id"]) for f in minors) + ".")
     qs = [(r["id"], q) for r in v.reqs for q in r.get("questions") or []] + \
          [(f"EC-{i:02d}", e["question"]) for i, e in enumerate(v.d.get("edge_cases") or [], 1) if e.get("question")]
-    if qs:
+    from .consolidate import similarity
+    uniq: list[tuple[list, str]] = []           # один вопрос — одна строка, со всеми источниками
+    for a, q in qs:
+        host = next((u for u in uniq if similarity(u[1], q) >= 0.6), None)
+        if host is None:
+            uniq.append(([a], q))
+        elif a not in host[0]:
+            host[0].append(a)
+    if uniq:
         o.h(3, "Вопросы к аналитику и бизнесу")
-        o.table(["Откуда", "Вопрос"], [[v.ref(a) if a in v.req_by else a, q] for a, q in qs], [14, 86])
+        o.table(["Откуда", "Вопрос"], [[", ".join(v.ref(a) if a in v.req_by else a for a in src), q]
+                                       for src, q in uniq], [14, 86])
 
 
 def _appendices(v: View, o: Out):
