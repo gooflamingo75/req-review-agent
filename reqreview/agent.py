@@ -8,7 +8,7 @@ import re
 import time
 from dataclasses import dataclass, field
 
-from . import prompts, rules
+from . import prompts, rules, verify
 from .consolidate import consolidate, similarity
 from .criteria import INDIVIDUAL, SET, SEVERITY, SEVERITY_ORDER
 from .llm import LLMError, log
@@ -70,6 +70,7 @@ class Requirement:
     questions: list[str] = field(default_factory=list)
     reviewed: bool = False
     linked: list = field(default_factory=list)   # системные дефекты набора, затрагивающие требование
+    related: list = field(default_factory=list)  # (дефект другого требования, его ID) — противоречия с этим
 
 
 @dataclass
@@ -86,6 +87,8 @@ class Result:
     started: float
     finished: float = 0.0
     llm_calls: int = 0
+    dropped: list[dict] = field(default_factory=list)
+    checks: dict = field(default_factory=dict)
 
 
 def _sev(s) -> str:
@@ -124,7 +127,7 @@ def extract(doc: Document, llm, warnings: list[str]) -> list[Requirement]:
     chunks = _chunks(doc)
     raw = []
     for i, ch in enumerate(chunks, 1):
-        log(f"[1/4] Выделение требований: фрагмент {i}/{len(chunks)}…")
+        log(f"[1/5] Выделение требований: фрагмент {i}/{len(chunks)}…")
         payload = {"lines": [(ln.gid, ln.text) for ln in ch]}
         data = llm.generate_json("extract", prompts.SYSTEM,
                                  prompts.extract_prompt(doc.title, doc.numbered(ch), i, len(chunks)), payload)
@@ -201,7 +204,7 @@ def review_requirements(doc: Document, reqs: list[Requirement], llm, batch_size:
     batches = [reqs[i:i + batch_size] for i in range(0, len(reqs), batch_size)]
     is_mock = llm.model == "mock"
     for bi, batch in enumerate(batches, 1):
-        log(f"[2/4] Проверка требований: пакет {bi}/{len(batches)} ({batch[0].id}…{batch[-1].id})…")
+        log(f"[2/5] Проверка требований: пакет {bi}/{len(batches)} ({batch[0].id}…{batch[-1].id})…")
         payload = [{"id": r.id, "doc_id": r.doc_id, "section": r.section, "kind": r.kind, "text": r.text,
                     "rule_hints": [f"«{h['trigger']}»: {h['problem']}" for h in hints[r.id] if h["trigger"]]}
                    for r in batch]
@@ -335,7 +338,7 @@ def review_set(doc: Document, reqs: list[Requirement], llm, warnings: list[str])
     edge_cases, trace = [], []
     for step, (part, title) in enumerate([("consistency", "непротиворечивость, архитектура и стандарты"),
                                           ("completeness", "полнота, пограничные сценарии, прослеживаемость")], 1):
-        log(f"[3/4] Проверка набора требований ({step}/2: {title})…")
+        log(f"[3/5] Проверка набора требований ({step}/3: {title})…")
         try:
             data = llm.generate_json(f"set_{part}", prompts.SYSTEM,
                                      prompts.set_prompt(part, doc.title, doc_text, rl, hints), {"requirements": rl})
@@ -360,7 +363,7 @@ def review_set(doc: Document, reqs: list[Requirement], llm, warnings: list[str])
                                  for k in ("goal", "ui", "api_data", "acceptance")},
                               "gap": collapse_ws(str(t.get("gap") or ""))})
     # часть 3: сценарный анализ противоречий между правилами + проверка тест-идей против правил
-    log("[3/4] Проверка набора требований (3/3: сценарный анализ противоречий между правилами)…")
+    log("[3/5] Проверка набора требований (3/3: сценарный анализ противоречий между правилами)…")
     known = [f"{', '.join(f.req_ids)}: {short(f.problem, 160)}" for f in findings if f.criterion == "S-CONS"]
     tests = [f"{r.id}: {t}" for r in reqs for t in r.test_ideas]
     try:
@@ -439,7 +442,7 @@ def review_set(doc: Document, reqs: list[Requirement], llm, warnings: list[str])
                     f"(пример — {cnf_reqs[0].id}: {sample.problem})",
             recommendation="Привести требования к единому шаблону «<Субъект> должен <действие> <условие>» "
                            "с уникальным идентификатором.",
-            req_ids=[r.id for r in cnf_reqs][:15], g1=cnf_reqs[0].g1, g2=cnf_reqs[0].g2, source="правило"))
+            req_ids=[r.id for r in cnf_reqs], g1=cnf_reqs[0].g1, g2=cnf_reqs[0].g2, source="правило"))
 
     # правила набора (ID, дубли)
     rd = [{"id": r.id, "doc_id": r.doc_id, "text": r.text} for r in reqs]
@@ -488,8 +491,33 @@ def run(doc: Document, llm, batch_size: int = 8) -> Result:
         warnings.append("В документе не найдено ни одного требования.")
     review_requirements(doc, reqs, llm, batch_size, warnings)
     set_findings, set_criteria, edge_cases, trace = review_set(doc, reqs, llm, warnings)
-    log("[4/4] Объединение дефектов по первопричине, верификация и формирование отчёта…")
+    acc = verify.acceptance_gaps(reqs, trace, Finding)
+    if acc is not None:
+        set_findings.append(acc)
+    log("[4/5] Объединение дефектов по первопричине…")
     set_findings, cstats = consolidate(reqs, set_findings, Finding)
+    if cstats["merged"]:
+        warnings.append(f"Объединено {cstats['merged']} повторных замечаний с общей первопричиной: каждый дефект "
+                        "показан один раз со списком всех мест, где он проявляется.")
+    _link_systemic(reqs, set_findings)
+    checks = {"pre": verify.self_check(doc, reqs, set_findings, Finding, final=False)}
+    _number(reqs, set_findings)
+
+    # самопроверка: LLM-ревьюер второго уровня + детерминированные проверки отчёта
+    log("[4/5] Самопроверка: ревьюер второго уровня ищет ложные срабатывания…")
+    doc_text = doc.numbered() if doc.char_count() <= SET_FULL_DOC_CHARS else doc.headings_outline()
+    dropped = verify.critic(doc, reqs, set_findings, llm, doc_text, prompts, warnings)
+    checks["sanitized"] = verify.sanitize(doc, [f for r in reqs for f in r.findings] + set_findings)
+    for r in reqs:
+        r.findings.sort(key=lambda f: (SEVERITY_ORDER[f.severity], list(INDIVIDUAL).index(f.criterion)))
+    set_findings.sort(key=lambda f: (SEVERITY_ORDER[f.severity], -len(f.locs)))
+    _link_systemic(reqs, set_findings)
+    _number(reqs, set_findings)
+    checks["post"] = verify.self_check(doc, reqs, set_findings, Finding, final=True)
+    if checks["sanitized"]:
+        warnings.append(f"В {checks['sanitized']} рекомендациях значения, отсутствующие в документе (URL/пути), "
+                        "заменены на «<указать …>».")
+    log("[5/5] Формирование отчёта…")
     for c, v in set_criteria.items():
         related = [f for f in set_findings if f.criterion == c]
         v["findings"] = related
@@ -497,39 +525,10 @@ def run(doc: Document, llm, batch_size: int = 8) -> Result:
             v["status"] = "fail"
         elif related and v["status"] in ("ok", "n/a"):
             v["status"] = "partial"
+        elif not related and v["status"] == "fail":
+            v["status"] = "partial"
         if v["comment"].startswith("Замечания: "):
             v["comment"] = ""
-    # системные дефекты (MAJOR/CRITICAL) показываем у каждого затронутого требования;
-    # противоречие с другим правилом переопределяет оценку «Непротиворечивость» требования
-    by_id = {r.id: r for r in reqs}
-    for f in set_findings:
-        if f.severity == "minor":
-            continue
-        for rid in f.req_ids:
-            r = by_id.get(rid)
-            if r is None:
-                continue
-            if f not in r.linked:
-                r.linked.append(f)
-            if f.criterion == "S-CONS" and (f.tag == "CONTRADICTION" or "ротиворе" in f.type):
-                others = [x for x in f.req_ids if x != rid]
-                r.criteria["CON"] = "fail"
-                r.comments["CON"] = ("Противоречит " + ", ".join(others) if others else "Противоречие") + \
-                    " — см. системный дефект в разделе 4.2."
-    if cstats["merged"]:
-        warnings.append(f"Объединено {cstats['merged']} повторных замечаний с общей первопричиной: каждый дефект "
-                        "показан один раз со списком всех мест, где он проявляется.")
-
-    n = 0
-    for r in reqs:
-        for f in r.findings:
-            n += 1
-            f.fid = f"F-{n:03d}"
-    for i, f in enumerate(set_findings, 1):
-        f.fid = f"S-{i:02d}"
-    for c, v in set_criteria.items():
-        if v["findings"] and not v["comment"]:
-            v["comment"] = "Замечания: " + ", ".join(f.fid for f in v["findings"])
 
     all_f = [f for r in reqs for f in r.findings] + set_findings
     by_part: dict[str, int] = {}
@@ -554,4 +553,37 @@ def run(doc: Document, llm, batch_size: int = 8) -> Result:
     }
     return Result(doc=doc, model_name=llm.name, requirements=reqs, set_findings=set_findings,
                   set_criteria=set_criteria, edge_cases=edge_cases, traceability=trace, stats=stats,
-                  warnings=warnings, started=started, finished=time.time(), llm_calls=llm.calls)
+                  warnings=warnings, started=started, finished=time.time(), llm_calls=llm.calls,
+                  dropped=dropped, checks=checks)
+
+
+def _number(reqs, set_findings):
+    n = 0
+    for r in reqs:
+        for f in r.findings:
+            n += 1
+            f.fid = f"F-{n:03d}"
+    for i, f in enumerate(set_findings, 1):
+        f.fid = f"S-{i:02d}"
+
+
+def _link_systemic(reqs, set_findings):
+    """Системные дефекты (MAJOR/CRITICAL) показываем у каждого затронутого требования;
+    противоречие с другим правилом переопределяет оценку «Непротиворечивость» требования."""
+    by_id = {r.id: r for r in reqs}
+    for r in reqs:
+        r.linked = [f for f in r.linked if f in set_findings]
+    for f in set_findings:
+        if f.severity == "minor":
+            continue
+        for rid in f.req_ids:
+            r = by_id.get(rid)
+            if r is None:
+                continue
+            if f not in r.linked:
+                r.linked.append(f)
+            if f.criterion == "S-CONS" and (f.tag == "CONTRADICTION" or "ротиворе" in f.type):
+                others = [x for x in f.req_ids if x != rid]
+                r.criteria["CON"] = "fail"
+                r.comments["CON"] = ("Противоречит " + ", ".join(others) if others else "Противоречие") + \
+                    " — см. системный дефект в разделе 4.2."

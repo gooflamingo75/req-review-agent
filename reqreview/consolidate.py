@@ -18,7 +18,7 @@ from .criteria import SEVERITY_ORDER
 # Теги дефектов, которые по своей природе системные: одна первопричина — много мест
 SYSTEMIC_TAGS = {
     "REST-METHOD", "STATUS-200", "UNITS", "DATA-TYPE", "SECTION-EMPTY", "PLACEHOLDER",
-    "VERSIONING", "APPROVALS", "PRIORITY",
+    "VERSIONING", "APPROVALS", "PRIORITY", "STRUCTURE", "ACCEPTANCE",
 }
 TAG_TITLES = {
     "REST-METHOD": "HTTP-метод не соответствует характеру операции",
@@ -31,6 +31,8 @@ TAG_TITLES = {
     "VERSIONING": "Нет версионирования",
     "APPROVALS": "Не заполнен блок согласования",
     "PRIORITY": "Нет приоритетов требований",
+    "STRUCTURE": "Нарушена структура документа",
+    "ACCEPTANCE": "Нет критериев приёмки",
     "TRACEABILITY": "Нарушена прослеживаемость",
 }
 # Взаимно близкие теги (модель называет одну проблему по-разному)

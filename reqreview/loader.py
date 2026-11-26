@@ -40,20 +40,39 @@ class Document:
     _owners: list[int] = field(default_factory=list, repr=False)
     _section: dict[int, str] = field(default_factory=dict, repr=False)
     _part: dict[int, str] = field(default_factory=dict, repr=False)
+    _item: dict[int, str] = field(default_factory=dict, repr=False)
+    misplaced: list = field(default_factory=list, repr=False)
 
     # ---------- построение индексов ----------
     def build(self) -> "Document":
         buf, starts, owners = [], [], []
         pos = 0
-        section, part = "", ""
+        part = ""
+        stack: list[tuple[int, str]] = []          # (уровень, заголовок) — путь по иерархии заголовков
         part_re = re.compile(r"^\s*#{0,3}\s*((Часть|Part|Документ|Приложение)\s+[\wА-Яа-я№-]+)", re.I)
         for ln in self.lines:
             if ln.is_heading:
-                section = collapse_ws(ln.text.lstrip("#").strip())[:90]
+                lvl = _heading_level(ln.text)
+                title = collapse_ws(ln.text.lstrip("#").strip())[:90]
+                while stack and stack[-1][0] >= lvl:
+                    stack.pop()
+                stack.append((lvl, title))
                 m = part_re.match(ln.text)
                 if m:
                     part = m.group(1).rstrip(".")
+            section = stack[-1][1] if stack else ""
+            # Пункт с собственной меткой («**401.** …») под заголовком с ДРУГОЙ меткой («200. …») —
+            # по смыслу относится к родительскому разделу; запоминаем это как структурную аномалию.
+            item = _item_label(ln.text) if not ln.is_heading else ""
+            if item and stack:
+                head = _item_label(stack[-1][1])
+                if head and head != item:
+                    parent = next((t for lv, t in reversed(stack[:-1])), "")
+                    if parent:
+                        self.misplaced.append((ln.gid, item, stack[-1][1], parent))
+                        section = parent
             self._section[ln.gid] = section
+            self._item[ln.gid] = item
             self._part[ln.gid] = part
             t = collapse_ws(ln.text)
             if not t:
@@ -170,6 +189,9 @@ class Document:
         sec = self._section.get(g1)
         if sec:
             loc += f", раздел «{sec}»"
+        item = self._item.get(g1)
+        if item and not (sec or "").startswith(item):
+            loc += f", пункт «{item}»"
         return loc
 
     def section_of(self, gid: int) -> str:
@@ -183,6 +205,24 @@ class Document:
 
 
 # ======================= чтение файлов =======================
+
+_ITEM_RE = re.compile(r"^\s*(?:[-*]\s*)?\*\*\s*([A-Za-zА-Яа-яЁё]{0,6}[-_.]?\d+(?:\.\d+)*)\.?\s*\*\*")
+_HEAD_LABEL_RE = re.compile(r"^\s*([A-Za-zА-Яа-яЁё]{0,6}[-_.]?\d+(?:\.\d+)*)[.\s]")
+
+
+def _item_label(t: str) -> str:
+    """Метка пункта: «**401.** …» → «401», «**Ф-1.** …» → «Ф-1»; для заголовка «200. Successful» → «200»."""
+    m = _ITEM_RE.match(t) or _HEAD_LABEL_RE.match(t.lstrip("#").strip() + " ")
+    return m.group(1) if m else ""
+
+
+def _heading_level(t: str) -> int:
+    s = t.lstrip()
+    if s.startswith("#"):
+        return len(s) - len(s.lstrip("#"))
+    m = _NUM_HEADING.match(s)
+    return (m.group(1).count(".") + 1) if m else 1
+
 
 def _is_heading_text(t: str) -> bool:
     s = t.strip()

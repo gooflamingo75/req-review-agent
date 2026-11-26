@@ -67,6 +67,21 @@ class ScriptedLLM:
                                                     "risk": "r", "question": "q?"}],
                     "traceability": [{"requirement": ids["КБ-1"], "goal": [], "ui": [], "api_data": [],
                                       "acceptance": [], "gap": "нет критерия приёмки"}]}
+        if task == "critic":
+            out = []
+            for it in payload["items"]:
+                if it["problem"] == "Субъективные оценки.":
+                    out.append({"id": it["id"], "verdict": "severity", "severity": "minor", "reason": "стиль"})
+                if "КБ-5" in it["problem"]:
+                    out.append({"id": it["id"], "verdict": "drop", "reason": "тест",
+                                "evidence_quote": "Кэшбэк начисляется быстро"})
+                if it["problem"] == "Сценарный конфликт.":
+                    out.append({"id": it["id"], "verdict": "drop", "reason": "выдумка",
+                                "evidence_quote": "этого текста нет в документе"})
+                if it["problem"] == "Нет срока начисления.":
+                    out.append({"id": it["id"], "verdict": "rewrite", "problem": "Нет срока начисления.",
+                                "recommendation": "Перейти на https://api.example.com/v2/cashback и /api/v1/cb/limits"})
+            return {"reviews": out}
         if task == "set_conflicts":
             ids = {r["doc_id"]: r["id"] for r in payload["requirements"]}
             return {"conflicts": [{"requirement_ids": [ids["КБ-1"], ids["КБ-4"]],
@@ -114,9 +129,17 @@ def test_scripted_pipeline():
     types = [f.type for f in res.set_findings]
     assert "Противоречие" in types
     assert not any(f.problem == "Выдумка" for f in res.set_findings), "непроверяемое замечание отброшено"
-    assert any(f.type == "Пропуск" and "КБ-5" in f.problem for f in res.set_findings), "пропуск в нумерации"
     assert res.set_criteria["S-CONS"]["status"] == "fail"
     assert any("Сценарий: Оплата" in f.problem for f in res.set_findings), "сценарный конфликт"
+    assert res.dropped and "Кэшбэк начисляется быстро" in res.dropped[0]["evidence"], "критик отклоняет с доказательством"
+    assert not any("КБ-5" in f.problem for f in res.set_findings)
+    r2c = next(r for r in res.requirements if r.doc_id == "КБ-2")
+    rec = next(f for f in r2c.findings if f.problem == "Нет срока начисления.").recommendation
+    assert "api.example.com" not in rec and "/api/v1" not in rec and "<указать" in rec, rec
+    for r in res.requirements:     # самопроверка: у каждой отметки ❌/⚠️ есть дефект
+        for c, st in r.criteria.items():
+            if st in ("warn", "fail"):
+                assert any(f.criterion == c for f in r.findings) or r.linked or r.related, (r.id, c)
     r1b = next(r for r in res.requirements if r.doc_id == "КБ-1")
     assert r1b.criteria["CON"] == "fail" and any("противоречит" in t for t in r1b.test_ideas)
     md = render(res, "test", "examples/sample_requirements.md")

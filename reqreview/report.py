@@ -65,7 +65,24 @@ class _R:
         return f"{rid}" + (f" ({r.doc_id})" if r and r.doc_id else "")
 
     def refs(self, ids) -> str:
-        return ", ".join(self.ref(i) for i in ids) or "—"
+        """Список требований; длинные последовательности сворачиваются в диапазоны (REQ-01–REQ-04)."""
+        ids = list(ids)
+        if len(ids) <= 6:
+            return ", ".join(self.ref(i) for i in ids) or "—"
+        order = {r.id: n for n, r in enumerate(self.res.requirements)}
+        known = sorted((i for i in ids if i in order), key=order.get)
+        parts, run = [], []
+        for i in known:
+            if run and order[i] == order[run[-1]] + 1:
+                run.append(i)
+            else:
+                if run:
+                    parts.append(run)
+                run = [i]
+        if run:
+            parts.append(run)
+        out = [f"{p[0]}–{p[-1]}" if len(p) > 2 else ", ".join(p) for p in parts]
+        return ", ".join(out + [i for i in ids if i not in order]) + f" (всего {len(ids)})"
 
     def label(self, f: Finding) -> str:
         part = self.doc.part_of(f.g1) if f.g1 is not None else ""
@@ -162,7 +179,7 @@ def render(res: Result, agent_version: str, input_display: str) -> str:
             sec = f"{r.part} / {r.section}"
         loc = d.location(r.g1, r.g2).split(", раздел")[0]
         w(f"| `{r.id}` | `{md_cell(r.doc_id or 'Без номера')}` | {md_cell(sec)} | {md_cell(loc)} | "
-          f"**{md_cell(short(r.summary, 90))}** — «{md_cell(short(r.text, 170))}» |")
+          f"**{md_cell(short(r.summary, 90))}** — «{md_cell(r.text)}» |")
     w("\n---\n")
 
     # ------------------------------------------------------------ 3
@@ -243,8 +260,10 @@ def render(res: Result, agent_version: str, input_display: str) -> str:
           + (f" (в {n_occ} {plural(n_occ, 'месте', 'местах', 'местах')})" if n_occ != s['by_severity'][sev] else "") + " |")
     if s.get("merged"):
         w(f"| Объединено повторов одной первопричины: | {s['merged']} |")
-    w(f"| Непокрытых пограничных сценариев: | {len(res.edge_cases)} |")
-    w(f"| Из них найдено автоматическими проверками (без LLM): | {s.get('rule_findings', 0)} |")
+    w(f"| Дефектов, найденных автоматическими проверками (без LLM): | {s.get('rule_findings', 0)} |")
+    if res.dropped:
+        w(f"| Отклонено при самопроверке (ложные срабатывания): | {len(res.dropped)} |")
+    w(f"| Непокрытых пограничных сценариев (вопросы к аналитику, не дефекты): | {len(res.edge_cases)} |")
     w("")
     w("**Распределение дефектов отдельных требований по критериям:**\n")
     w("| Критерий | Дефектов |\n| :--- | :---: |")
@@ -337,8 +356,23 @@ def render(res: Result, agent_version: str, input_display: str) -> str:
     w("- Все цитаты сверены с текстом документа автоматически; замечания модели без подтверждаемой цитаты "
       "или ссылки на требование в отчёт не включаются.")
     w(f"- Замечаний модели, привязанных ко всей формулировке из-за неточной цитаты: {s['unverified']}.")
+    ch = res.checks or {}
+    pre, post = ch.get("pre", {}), ch.get("post", {})
+    if ch:
+        w(f"- Самопроверка согласованности отчёта: оценок без подтверждающего дефекта оформлено как дефект — "
+          f"{pre.get('created', 0)}, снято — {pre.get('cleared', 0) + post.get('cleared', 0)}; противоречий, "
+          f"отражённых у второй стороны, — {pre.get('linked', 0) + post.get('linked', 0)}; исправлено комментариев — "
+          f"{pre.get('comments', 0) + post.get('comments', 0)}.")
     for wn in dict.fromkeys(res.warnings):
         w(f"- {wn}")
+    if res.dropped:
+        w("\n### Отклонено при самопроверке (ложные срабатывания)\n")
+        w("LLM-ревьюер второго уровня отклонил эти кандидаты в дефекты; для каждого приведено место документа, "
+          "которое их опровергает.\n")
+        w("| Где | Кандидат в дефект | Почему отклонён | Доказательство |\n| :--- | :--- | :--- | :--- |")
+        for d_ in res.dropped:
+            w(f"| {md_cell(d_['where'])} | {md_cell(short(d_['problem'], 200))} | {md_cell(d_['reason'] or '—')} | "
+              f"{md_cell(d_['evidence'] or 'стандартное поле шаблона')} |")
     w(f"\n*Отчёт сформирован автоматически агентом req-review-agent {agent_version}.*")
     return "\n".join(out) + "\n"
 
@@ -366,6 +400,10 @@ def _req_block(R: _R, r: Requirement, w) -> None:
         w("* **Системные дефекты, затрагивающие требование** (описаны один раз в разделе 4):")
         for m in r.linked:
             w(f"  * `[{SEVERITY[m.severity]}]` {SEV_ICON[m.severity]} **{m.fid}** {R.label(m)} — {short(m.problem, 160)}")
+    if getattr(r, "related", None):
+        w("* **Противоречия, найденные у других требований:**")
+        for f, rid in r.related:
+            w(f"  * `[{SEVERITY[f.severity]}]` {SEV_ICON[f.severity]} **{f.fid}** у {R.ref(rid)} — {short(f.problem, 200)}")
     if r.findings:
         w("* **Выявленные дефекты:**")
         for f in r.findings:
@@ -375,7 +413,7 @@ def _req_block(R: _R, r: Requirement, w) -> None:
             w("* **Рекомендация по исправлению:**")
             for f in recs:
                 w(f"  * ({f.fid}) {f.recommendation}")
-    elif not r.linked:
+    elif not r.linked and not getattr(r, "related", None):
         w("* **Выявленные дефекты:** " + ("не выявлено." if r.reviewed else "⚠️ модель не вернула результат; "
                                                                              "правила дефектов не выявили."))
     if r.test_ideas:

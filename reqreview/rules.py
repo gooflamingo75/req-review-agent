@@ -218,7 +218,7 @@ def check_set(reqs: list[dict]) -> list[dict]:
         no_id = [r["id"] for r in reqs if not r.get("doc_id")]
         out.append({
             "type": "Трассируемость", "criterion": "S-TRC", "severity": "minor",
-            "requirement_ids": no_id[:15], "quotes": [],
+            "requirement_ids": no_id, "quotes": [],
             "problem": f"{len(no_id)} из {len(reqs)} требований не имеют идентификатора в документе.",
             "recommendation": "Присвоить идентификаторы всем требованиям.",
         })
@@ -340,6 +340,22 @@ def check_document(doc) -> list[dict]:
             "problem": "Версия и дата документа не заполнены — нельзя однозначно сослаться на согласованную редакцию.",
             "recommendation": "Указать версию, дату и историю изменений документа.",
         })
+
+    # 4б. Структура: пункты с собственной меткой под заголовком с другой меткой
+    by_head: dict[str, list] = {}
+    for gid, item, head, parent in getattr(doc, "misplaced", []):
+        by_head.setdefault(head, []).append((gid, item))
+    for head, items in by_head.items():
+        ln0 = next(ln for ln in lines if ln.gid == items[0][0])
+        out.append({
+            "type": "Структура", "criterion": "S-COMP", "severity": "minor", "tag": "STRUCTURE",
+            "locs": [(g, collapse(next(ln.text for ln in lines if ln.gid == g))[:120]) for g, _ in items],
+            "problem": (f"Пункты {', '.join('«' + i + '»' for _, i in items)} размещены" if len(items) > 1
+                        else f"Пункт «{items[0][1]}» размещён") + f" под заголовком «{head}», "
+                       "который относится к другому пункту, — читатель может отнести их описание не к тому разделу.",
+            "recommendation": "Вынести каждый пункт под собственный заголовок или в общий раздел-перечень.",
+        })
+        del ln0
 
     # 5. Заголовок Content-Type при отсутствии тела
     ct = find(r"Content-Type[^a-z]*application/json")
