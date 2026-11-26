@@ -100,6 +100,12 @@ class ScriptedLLM:
                 {"type": "Пропуск", "criterion": "S-COMPL", "severity": "major", "requirement_ids": [],
                  "quotes": ["этого текста нет в документе"], "problem": "Выдумка", "recommendation": "-"},
             ], "set_criteria": {"S-CONS": {"status": "ok", "comment": ""}}}
+        if task == "why_critical":
+            return {"items": [{"id": it["id"], "trigger": "Оплата 10 000 ₸ в конце месяца",
+                               "development": "Нельзя выбрать лимит", "testing": "Два ожидаемых результата",
+                               "business": "", "exploitation": "", "scenario": "A: 5 000; B: 3 000",
+                               "resolution": "Выбрать один лимит", "closure": "В документе один лимит",
+                               "severity_ok": "yes"} for it in payload["items"]]}
         raise AssertionError(task)
 
 

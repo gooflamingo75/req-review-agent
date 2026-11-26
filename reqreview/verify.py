@@ -27,7 +27,7 @@ _LINE_REF = re.compile(r"\[L(\d+)\]|\bстрок[аеиу]?\s+(\d+)", re.I)
 
 
 # ------------------------------------------------------------------ 1. критик
-def critic(doc, reqs, set_findings, llm, doc_text: str, prompts_mod, warnings: list[str]) -> list[dict]:
+def critic(doc, reqs, set_findings, llm, doc_text: str, prompts_mod, warnings: list[str], cov=None) -> list[dict]:
     """Возвращает список отклонённых дефектов (для приложения отчёта)."""
     items, index = [], {}
     for r in reqs:
@@ -41,14 +41,25 @@ def critic(doc, reqs, set_findings, llm, doc_text: str, prompts_mod, warnings: l
         items.append({"id": f.fid, "level": "набор", "requirements": f.req_ids[:10], "criterion": f.criterion,
                       "severity": f.severity, "quotes": [short(q, 160) for q in f.quotes[:4]],
                       "problem": f.problem, "recommendation": f.recommendation})
-    if not items or llm.model == "mock":
+    title = "Самопроверка: ревьюер второго уровня"
+    if llm.model == "mock":
+        if cov:
+            cov.check("critic", title, "не выполнена", "демо-режим без модели")
+        return []
+    if not items:
+        if cov:
+            cov.check("critic", title, "выполнена", "дефектов для проверки нет")
         return []
     log(f"[4/5] Самопроверка: LLM-ревьюер проверяет {len(items)} дефектов на ложные срабатывания и критичность…")
     try:
         data = llm.generate_json("critic", prompts_mod.SYSTEM, prompts_mod.critic_prompt(doc.title, doc_text, items),
                                  {"items": items})
+        if cov:
+            cov.check("critic", title, "выполнена")
     except LLMError as e:
         warnings.append(f"Самопроверка LLM-ревьюером не выполнена: {e}.")
+        if cov:
+            cov.check("critic", title, "не выполнена", str(e)[:200])
         return []
     dropped, changed = [], 0
     for rv in (data.get("reviews") or []) if isinstance(data, dict) else []:
@@ -191,3 +202,75 @@ def acceptance_gaps(reqs, trace, finding_cls):
                        "правила и каждой его ветви (границы, исключения, повторы, смена настроек).",
         req_ids=[r.id for r in missing], locs=[(r.g1, r.g2) for r in missing], quotes=quotes,
         g1=missing[0].g1, g2=missing[0].g2)
+
+
+# ------------------------------------------------------------------ 5. недостоверный OCR не даёт CRITICAL
+def ocr_guard(doc, findings, min_conf: float = 85.0) -> int:
+    """Если доказательство дефекта CRITICAL целиком взято из строк, распознанных OCR с невысокой уверенностью,
+    дефект не считается подтверждённым критичным: понижаем до MAJOR и требуем сверки с оригиналом."""
+    by = doc.by_gid
+    n = 0
+    for f in findings:
+        if f.severity != "critical":
+            continue
+        spans = f.locs or ([(f.g1, f.g2)] if f.g1 is not None else [])
+        lines = [by[g] for a, b in spans for g in range(a, (b or a) + 1) if g in by and by[g].text.strip()]
+        if lines and all(ln.src == "ocr" and (ln.conf is None or ln.conf < min_conf) for ln in lines):
+            confs = [ln.conf for ln in lines if ln.conf is not None]
+            f.severity = "major"
+            f.caveat = ("Критичность понижена с CRITICAL: доказательство распознано OCR"
+                        + (f" (уверенность движка ≈{min(confs):.0f})" if confs else "")
+                        + ". Сверьте числа, отрицания и знаки сравнения с оригиналом страницы.")
+            n += 1
+    return n
+
+
+# ------------------------------------------------------------------ 6. «Почему это критично»
+WHY_KEYS = ("trigger", "development", "testing", "business", "exploitation", "scenario", "resolution", "closure")
+
+
+def explain_critical(doc, reqs, set_findings, llm, doc_text: str, prompts_mod, warnings: list[str], cov=None) -> None:
+    from . import rules
+    crit = [f for r in reqs for f in r.findings if f.severity == "critical"] + \
+           [f for f in set_findings if f.severity == "critical"]
+    title = "Обоснование критичных дефектов («Почему это критично»)"
+    for f in crit:                                          # запасной вариант для правил без LLM
+        if f.source == "правило" and f.tag in rules.WHY_CRITICAL:
+            f.why = dict(rules.WHY_CRITICAL[f.tag])
+    if not crit:
+        if cov:
+            cov.check("why", title, "выполнена", "критичных дефектов нет")
+        return
+    if llm.model == "mock":
+        if cov:
+            cov.check("why", title, "не выполнена", "демо-режим без модели")
+        return
+    items = [{"id": f.fid, "criterion": f.criterion, "requirements": f.req_ids[:8], "problem": f.problem,
+              "quotes": [short(q, 200) for q in (f.quotes or [f.quote])[:4]], "recommendation": f.recommendation}
+             for f in crit]
+    log(f"[4/5] Обоснование критичности: {len(items)} дефектов…")
+    try:
+        data = llm.generate_json("why_critical", prompts_mod.SYSTEM,
+                                 prompts_mod.why_prompt(doc.title, doc_text, items), {"items": items})
+    except LLMError as e:
+        warnings.append(f"Обоснование критичных дефектов не сформировано: {e}.")
+        if cov:
+            cov.check("why", title, "не выполнена", str(e)[:200])
+        return
+    idx = {f.fid: f for f in crit}
+    got = 0
+    for x in (data.get("items") or []) if isinstance(data, dict) else []:
+        if not isinstance(x, dict) or x.get("id") not in idx:
+            continue
+        f = idx[x["id"]]
+        why = {k: collapse_ws(str(x.get(k) or "")) for k in WHY_KEYS}
+        if str(x.get("severity_ok", "yes")).lower() in ("no", "false", "нет"):
+            f.severity = "major"
+            f.caveat = "Критичность понижена до MAJOR: последствия не подтвердились при обосновании. " + \
+                       collapse_ws(str(x.get("severity_reason") or ""))
+            continue
+        f.why = {k: v for k, v in why.items() if v}
+        got += 1
+    if cov:
+        cov.check("why", title, "выполнена" if got or not crit else "не выполнена",
+                  "" if got else "модель не вернула обоснований")

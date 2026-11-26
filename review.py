@@ -3,6 +3,11 @@
 
     python review.py <файл требований> <файл отчёта>
 
+Создаются три файла: отчёт PDF (основной), тот же отчёт в Markdown и данные JSON.
+Код завершения: 0 — проверка завершена полностью; 10 — частичная проверка (отчёт создан, ограничения указаны
+в панели); 11 — в документе нет оцениваемых требований; 2 — документ нельзя прочитать (создан диагностический
+отчёт); 3 — модель недоступна (создан диагностический отчёт); 4 — не удалось создать PDF (Markdown и JSON есть).
+
 Пример:
     python review.py docs/requirements.md reports/report.md
 """
@@ -55,7 +60,7 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser(
         description="ИИ-агент статической проверки документа требований (ISO/IEC/IEEE 29148, IEEE 830).")
     p.add_argument("input", nargs="?", help="путь к документу требований (.pdf, .docx, .md, .txt)")
-    p.add_argument("output", nargs="?", help="путь к файлу отчёта (.md); рядом будет создан .json")
+    p.add_argument("output", nargs="?", help="путь к отчёту (.md или .pdf); рядом создаются .md, .pdf и .json")
     p.add_argument("--input", "-i", dest="input_opt", help="то же, что позиционный аргумент input")
     p.add_argument("--output", "-o", dest="output_opt", help="то же, что позиционный аргумент output")
     p.add_argument("--model", help="модель Gemini (по умолчанию из .env или gemini-3.8-flash)")
@@ -75,18 +80,44 @@ def main(argv=None) -> int:
         pass
 
     from reqreview.agent import run
+    from reqreview.ingest import InputError
     from reqreview.llm import GeminiLLM, LLMError, MockLLM, OpenAICompatLLM
     from reqreview.loader import load_document
-    from reqreview.report import write
+    from reqreview.report import write, write_diagnostic
+
+    try:
+        shown = os.path.relpath(Path(a.input).resolve(), Path.cwd())
+    except ValueError:
+        shown = Path(a.input).name
+    version = agent_version()
+
+    def report_files(files: dict, ok_word: str) -> None:
+        print(f"\n{ok_word}", file=sys.stderr)
+        if files.get("pdf"):
+            print(f"  Отчёт (PDF): {Path(files['pdf']).resolve()}", file=sys.stderr)
+        else:
+            print(f"  ⚠ PDF не создан: {files.get('pdf_error')}", file=sys.stderr)
+        print(f"  Отчёт (Markdown): {files['md'].resolve()}", file=sys.stderr)
+        print(f"  Данные (JSON): {files['json'].resolve()}", file=sys.stderr)
 
     try:
         doc = load_document(a.input)
+    except InputError as e:
+        print(f"ОШИБКА: документ нельзя проверить — {e}", file=sys.stderr)
+        files = write_diagnostic(e.ingestion, "failed", [f"{e}."], a.output, version, shown)
+        report_files(files, "Создан диагностический отчёт (проверка по существу не выполнялась):")
+        return 2
     except Exception as e:  # noqa: BLE001
         print(f"ОШИБКА чтения документа: {e}", file=sys.stderr)
         return 2
-    print(f"Документ: «{doc.title}» ({doc.fmt}, {len(doc.nonempty())} непустых строк)", file=sys.stderr)
+    ing = doc.ingest
+    print(f"Документ: «{doc.title}» ({doc.fmt}, {ing.size_human()}, {len(doc.nonempty())} непустых строк; "
+          f"приём: {ing.status}, OCR: {ing.ocr_state})", file=sys.stderr)
+    for i in ing.issues:
+        print(f"  {i.id}: {i.location} — {i.observation}", file=sys.stderr)
 
     mock = a.mock or os.getenv("LLM_PROVIDER", "").lower() == "mock"
+    llm = None
     try:
         provider = os.getenv("LLM_PROVIDER", "gemini").lower().strip()
         if mock:
@@ -111,23 +142,24 @@ def main(argv=None) -> int:
         result = run(doc, llm, batch_size=max(1, batch))
     except LLMError as e:
         print(f"\nОШИБКА модели: {e}", file=sys.stderr)
+        files = write_diagnostic(ing, "failed", [f"Языковая модель недоступна или вернула ошибку: {e}"], a.output,
+                                 version, shown, llm.name if llm else "—", doc)
+        report_files(files, "Создан диагностический отчёт (документ прочитан, проверка моделью не выполнена):")
         return 3
     except KeyboardInterrupt:
         print("\nОстановлено пользователем.", file=sys.stderr)
         return 130
 
-    try:
-        shown = os.path.relpath(Path(a.input).resolve(), Path.cwd())
-    except ValueError:
-        shown = Path(a.input).name
-    files = write(result, a.output, agent_version(), shown)
+    files = write(result, a.output, version, shown)
     s = result.stats
-    print("\nГотово!", file=sys.stderr)
-    print(f"  Требований: {s['requirements']}, нарушений: {s['findings']} "
+    from reqreview.coverage import STATUS_RU
+    report_files(files, f"Готово! Статус проверки: {STATUS_RU[result.status]}"
+                 + (f" ({' '.join(result.status_reasons)})" if result.status_reasons else ""))
+    print(f"  Требований: {s['requirements']}, дефектов: {s['findings']} "
           f"(критичных: {s['by_severity']['critical']})", file=sys.stderr)
-    print(f"  Отчёт: {files[0].resolve()}", file=sys.stderr)
-    print(f"  Данные (JSON): {files[1].resolve()}", file=sys.stderr)
-    return 0
+    if not files.get("pdf"):
+        return 4
+    return {"completed": 0, "partial": 10, "na": 11, "failed": 12}.get(result.status, 0)
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 
 from . import prompts, rules, verify
 from .consolidate import consolidate, similarity
+from .coverage import Coverage, run_status
 from .criteria import INDIVIDUAL, SET, SEVERITY, SEVERITY_ORDER
 from .llm import LLMError, log
 from .loader import Document
@@ -45,6 +46,8 @@ class Finding:
     quotes: list[str] = field(default_factory=list)
     merged: int = 0                         # сколько повторов той же первопричины объединено в этот дефект
     also: list[str] = field(default_factory=list)   # другие формулировки той же первопричины
+    why: dict = field(default_factory=dict)          # «Почему это критично» (для CRITICAL)
+    caveat: str = ""                                 # оговорка (например, доказательство распознано OCR)
 
     def __eq__(self, other):                # сравнение по идентичности объекта (для списков и remove)
         return self is other
@@ -89,6 +92,9 @@ class Result:
     llm_calls: int = 0
     dropped: list[dict] = field(default_factory=list)
     checks: dict = field(default_factory=dict)
+    coverage: dict = field(default_factory=dict)
+    status: str = "completed"
+    status_reasons: list[str] = field(default_factory=list)
 
 
 def _sev(s) -> str:
@@ -123,15 +129,37 @@ def _chunks(doc: Document) -> list[list]:
     return out
 
 
-def extract(doc: Document, llm, warnings: list[str]) -> list[Requirement]:
+def extract(doc: Document, llm, warnings: list[str], cov: Coverage | None = None) -> list[Requirement]:
     chunks = _chunks(doc)
     raw = []
+    starts = [doc.span(ch[0].gid)[0] for ch in chunks]
     for i, ch in enumerate(chunks, 1):
         log(f"[1/5] Выделение требований: фрагмент {i}/{len(chunks)}…")
+        a = 0 if i == 1 else starts[i - 1]
+        b = starts[i] if i < len(chunks) else doc.canon_len
+        rec = cov.chunk(f"EXT-{i:02d}", "extract", [(a, b)]) if cov else None
         payload = {"lines": [(ln.gid, ln.text) for ln in ch]}
-        data = llm.generate_json("extract", prompts.SYSTEM,
-                                 prompts.extract_prompt(doc.title, doc.numbered(ch), i, len(chunks)), payload)
+        try:
+            if rec:
+                cov.sent(rec)
+            data = llm.generate_json("extract", prompts.SYSTEM,
+                                     prompts.extract_prompt(doc.title, doc.numbered(ch), i, len(chunks)), payload)
+        except LLMError as e:
+            if rec:
+                cov.done(rec, False, str(e)[:200])
+            if _fatal(e):
+                raise
+            warnings.append(f"Фрагмент {i}/{len(chunks)} документа не обработан моделью: {e}. "
+                            "Требования из него не выделены и не проверены.")
+            continue
         items = data.get("requirements", []) if isinstance(data, dict) else data
+        if not isinstance(items, list):
+            if rec:
+                cov.done(rec, False, "ответ модели не соответствует схеме")
+            warnings.append(f"Фрагмент {i}/{len(chunks)}: ответ модели не соответствует схеме; фрагмент не проверен.")
+            continue
+        if rec:
+            cov.done(rec, True)
         raw.extend(x for x in (items or []) if isinstance(x, dict))
 
     gids = {ln.gid for ln in doc.lines}
@@ -193,11 +221,14 @@ def _bump(r: Requirement, c: str, status: str):
         r.criteria[c] = status
 
 
-def review_requirements(doc: Document, reqs: list[Requirement], llm, batch_size: int, warnings: list[str]):
-    if doc.char_count() <= FULL_CONTEXT_CHARS:
+def review_requirements(doc: Document, reqs: list[Requirement], llm, batch_size: int, warnings: list[str],
+                        cov: Coverage | None = None):
+    full = doc.char_count() <= FULL_CONTEXT_CHARS
+    if full:
         context = doc.numbered()
     else:
         context = "Структура документа (заголовки):\n" + doc.headings_outline()
+    ctx_spans = [(0, doc.canon_len)] if full else [doc.span(ln.gid) for ln in doc.lines if ln.is_heading]
     hints = {r.id: rules.check_requirement(r.text) for r in reqs}
     by_id = {r.id: r for r in reqs}
     by_num = {re.sub(r"\D", "", r.id).lstrip("0"): r for r in reqs}
@@ -208,11 +239,16 @@ def review_requirements(doc: Document, reqs: list[Requirement], llm, batch_size:
         payload = [{"id": r.id, "doc_id": r.doc_id, "section": r.section, "kind": r.kind, "text": r.text,
                     "rule_hints": [f"«{h['trigger']}»: {h['problem']}" for h in hints[r.id] if h["trigger"]]}
                    for r in batch]
+        recs = [cov.chunk(f"REV-{bi:02d}/{r.id}", "review", [doc.span(r.g1, r.g2)], [r.id]) for r in batch] if cov else []
+        for rc in recs:
+            cov.sent(rc, ctx_spans)
         try:
             data = llm.generate_json("review", prompts.SYSTEM,
                                      prompts.review_prompt(doc.title, context, payload),
                                      {"requirements": payload})
         except LLMError as e:
+            for rc in recs:
+                cov.done(rc, False, str(e)[:200])
             warnings.append(f"Пакет {batch[0].id}…{batch[-1].id} не проверен моделью: {e}. Применены только правила.")
             data = {"results": []}
         results = data.get("results", []) if isinstance(data, dict) else (data or [])
@@ -250,6 +286,10 @@ def review_requirements(doc: Document, reqs: list[Requirement], llm, batch_size:
                                           recommendation=collapse_ws(str(f.get("recommendation") or "")),
                                           quote=q, g1=g1, g2=g2, verified=ok, req_ids=[r.id], tag=_tag(f.get("tag")),
                                           source="правило" if is_mock else "LLM"))
+
+        for rc, r in zip(recs, batch):
+            if rc.status == "sent":
+                cov.done(rc, r.reviewed, "" if r.reviewed else "модель не вернула результат по требованию")
 
     # правила: добавляем значимые срабатывания, которые модель не учла
     for r in reqs:
@@ -323,7 +363,7 @@ def _covered(rule: dict, findings: list[Finding]) -> bool:
     return False
 
 
-def review_set(doc: Document, reqs: list[Requirement], llm, warnings: list[str]):
+def review_set(doc: Document, reqs: list[Requirement], llm, warnings: list[str], cov: Coverage | None = None):
     if doc.char_count() <= SET_FULL_DOC_CHARS:
         doc_text = doc.numbered()
     else:
@@ -342,9 +382,13 @@ def review_set(doc: Document, reqs: list[Requirement], llm, warnings: list[str])
         try:
             data = llm.generate_json(f"set_{part}", prompts.SYSTEM,
                                      prompts.set_prompt(part, doc.title, doc_text, rl, hints), {"requirements": rl})
+            if cov:
+                cov.check(f"set_{part}", f"Набор: {title}", "выполнена")
         except LLMError as e:
             warnings.append(f"Проверка набора ({title}) моделью не выполнена: {e}. Применены только правила.")
             data = {}
+            if cov:
+                cov.check(f"set_{part}", f"Набор: {title}", "не выполнена", str(e)[:200])
         if not isinstance(data, dict):
             data = {}
         findings += _set_findings_from(data, doc, by_id, counters)
@@ -370,9 +414,13 @@ def review_set(doc: Document, reqs: list[Requirement], llm, warnings: list[str])
         data = llm.generate_json("set_conflicts", prompts.SYSTEM,
                                  prompts.conflicts_prompt(doc.title, doc_text, rl, hints, known, tests),
                                  {"requirements": rl})
+        if cov:
+            cov.check("set_conflicts", "Набор: сценарный анализ противоречий", "выполнена")
     except LLMError as e:
         warnings.append(f"Сценарный анализ противоречий моделью не выполнен: {e}.")
         data = {}
+        if cov:
+            cov.check("set_conflicts", "Набор: сценарный анализ противоречий", "не выполнена", str(e)[:200])
     if isinstance(data, dict):
         conf = []
         for c in data.get("conflicts") or []:
@@ -479,18 +527,28 @@ def review_set(doc: Document, reqs: list[Requirement], llm, warnings: list[str])
 
 
 # ------------------------------------------------------------------ всё вместе
+def _fatal(e: Exception) -> bool:
+    """Ошибки, при которых продолжать бессмысленно (ключ, доступ) — их не превращаем в «частичную проверку»."""
+    t = str(e).lower()
+    return any(k in t for k in ("api key", "api_key", "permission", "unauthenticated", "401", "403", "ключ"))
+
+
 def run(doc: Document, llm, batch_size: int = 8) -> Result:
     warnings: list[str] = []
     started = time.time()
+    cov = Coverage(doc)
     if llm.model == "mock":
         warnings.append("Отчёт сформирован в ДЕМО-режиме без языковой модели (только правила). "
                         "Для сдачи запустите агента с ключом Gemini.")
-    reqs = extract(doc, llm, warnings)
+    reqs = extract(doc, llm, warnings, cov)
+    if cov.chunks and all(c.status == "failed" for c in cov.chunks if c.kind == "extract"):
+        raise LLMError("ни один фрагмент документа не обработан моделью: " + cov.chunks[-1].note)
     log(f"      найдено требований: {len(reqs)}")
     if not reqs:
         warnings.append("В документе не найдено ни одного требования.")
-    review_requirements(doc, reqs, llm, batch_size, warnings)
-    set_findings, set_criteria, edge_cases, trace = review_set(doc, reqs, llm, warnings)
+    review_requirements(doc, reqs, llm, batch_size, warnings, cov)
+    set_findings, set_criteria, edge_cases, trace = review_set(doc, reqs, llm, warnings, cov)
+    cov.check("rules", "Автоматические проверки документа (без LLM)", "выполнена")
     acc = verify.acceptance_gaps(reqs, trace, Finding)
     if acc is not None:
         set_findings.append(acc)
@@ -506,7 +564,7 @@ def run(doc: Document, llm, batch_size: int = 8) -> Result:
     # самопроверка: LLM-ревьюер второго уровня + детерминированные проверки отчёта
     log("[4/5] Самопроверка: ревьюер второго уровня ищет ложные срабатывания…")
     doc_text = doc.numbered() if doc.char_count() <= SET_FULL_DOC_CHARS else doc.headings_outline()
-    dropped = verify.critic(doc, reqs, set_findings, llm, doc_text, prompts, warnings)
+    dropped = verify.critic(doc, reqs, set_findings, llm, doc_text, prompts, warnings, cov)
     checks["sanitized"] = verify.sanitize(doc, [f for r in reqs for f in r.findings] + set_findings)
     for r in reqs:
         r.findings.sort(key=lambda f: (SEVERITY_ORDER[f.severity], list(INDIVIDUAL).index(f.criterion)))
@@ -514,6 +572,8 @@ def run(doc: Document, llm, batch_size: int = 8) -> Result:
     _link_systemic(reqs, set_findings)
     _number(reqs, set_findings)
     checks["post"] = verify.self_check(doc, reqs, set_findings, Finding, final=True)
+    checks["ocr_guard"] = verify.ocr_guard(doc, [f for r in reqs for f in r.findings] + set_findings)
+    verify.explain_critical(doc, reqs, set_findings, llm, doc_text, prompts, warnings, cov)
     if checks["sanitized"]:
         warnings.append(f"В {checks['sanitized']} рекомендациях значения, отсутствующие в документе (URL/пути), "
                         "заменены на «<указать …>».")
@@ -551,10 +611,14 @@ def run(doc: Document, llm, batch_size: int = 8) -> Result:
         "rule_findings": sum(1 for f in all_f if f.source == "правило"),
         "mock": llm.model == "mock",
     }
+    csum = cov.summary()
+    status, reasons = run_status(doc.ingest, csum, len(reqs), sum(1 for r in reqs if r.reviewed), llm.model == "mock")
+    stats["affected_reqs"] = stats["with_issues"]
+    stats["reviewed_reqs"] = sum(1 for r in reqs if r.reviewed)
     return Result(doc=doc, model_name=llm.name, requirements=reqs, set_findings=set_findings,
                   set_criteria=set_criteria, edge_cases=edge_cases, traceability=trace, stats=stats,
                   warnings=warnings, started=started, finished=time.time(), llm_calls=llm.calls,
-                  dropped=dropped, checks=checks)
+                  dropped=dropped, checks=checks, coverage=csum, status=status, status_reasons=reasons)
 
 
 def _number(reqs, set_findings):
