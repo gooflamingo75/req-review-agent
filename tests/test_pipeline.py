@@ -67,6 +67,14 @@ class ScriptedLLM:
                                                     "risk": "r", "question": "q?"}],
                     "traceability": [{"requirement": ids["КБ-1"], "goal": [], "ui": [], "api_data": [],
                                       "acceptance": [], "gap": "нет критерия приёмки"}]}
+        if task == "set_conflicts":
+            ids = {r["doc_id"]: r["id"] for r in payload["requirements"]}
+            return {"conflicts": [{"requirement_ids": [ids["КБ-1"], ids["КБ-4"]],
+                                   "quotes": ["получает кэшбэк 2%", "отображается в истории операций"],
+                                   "scenario": "Оплата 10 000 ₸", "outcomes": "по A: 200; по B: иначе",
+                                   "severity": "major", "problem": "Сценарный конфликт.", "recommendation": "r"}],
+                    "bad_test_ideas": [{"requirement_id": ids["КБ-1"], "test_idea": "10 000 → 200",
+                                        "violates": [ids["КБ-3"]], "why": "лимит"}]}
         if task == "set_consistency":
             ids = {r["doc_id"]: r["id"] for r in payload["requirements"]}
             return {"findings": [
@@ -108,6 +116,9 @@ def test_scripted_pipeline():
     assert not any(f.problem == "Выдумка" for f in res.set_findings), "непроверяемое замечание отброшено"
     assert any(f.type == "Пропуск" and "КБ-5" in f.problem for f in res.set_findings), "пропуск в нумерации"
     assert res.set_criteria["S-CONS"]["status"] == "fail"
+    assert any("Сценарий: Оплата" in f.problem for f in res.set_findings), "сценарный конфликт"
+    r1b = next(r for r in res.requirements if r.doc_id == "КБ-1")
+    assert r1b.criteria["CON"] == "fail" and any("противоречит" in t for t in r1b.test_ideas)
     md = render(res, "test", "examples/sample_requirements.md")
     for section in ("Паспорт прогона", "Нарезка и инвентаризация требований", "Детальная проверка каждого требования",
                     "Проверка набора требований в целом", "Сводная статистика", "Итоговый вердикт",
