@@ -85,6 +85,9 @@ DESIGN_RE = re.compile(
     r"микросервис\w*|монолит\w*|REST(ful)?|SOAP|GraphQL|gRPC|JSON|XML|кнопк\w*|выпадающ\w*\s+спис\w*|"
     r"чекбокс\w*|всплывающ\w*\s+окн\w*|модальн\w*\s+окн\w*|красн\w*\s+цвет\w*|зел[её]н\w*\s+цвет\w*)(?![\w-])", _I)
 
+# имена классов/компонентов реализации внутри требований (AlertsController, PaymentService, UserRepository…)
+IMPL_RE = re.compile(r"(?<![\w-])[A-Z][A-Za-z0-9]+(Controller|Service|Repository|Handler|Manager|Impl|DAO|Dao|Entity)(?![\w-])")
+
 MODAL_RE = re.compile(r"\b(должен|должна|должно|должны|обязан\w*|необходимо|shall|must)\b", _I)
 
 ID_RE = re.compile(r"^([A-Za-zА-Яа-яЁё]+(?:[-_.][A-Za-zА-Яа-яЁё]+)*)[-_.]?(\d+(?:\.\d+)*)$")
@@ -147,6 +150,19 @@ def check_requirement(text: str) -> list[dict]:
                        "возможно, это лишнее ограничение реализации.",
             "recommendation": "Если это не обоснованное внешнее ограничение, сформулировать требуемое свойство, а не способ реализации; "
                               "иначе указать источник ограничения.",
+        })
+    for m in IMPL_RE.finditer(text):
+        key = (m.group(0).lower(), "APP")
+        if key in seen:
+            continue
+        seen.add(key)
+        hits.append({
+            "criterion": "APP", "criteria": ["APP", "NEC"], "severity": "minor", "trigger": m.group(0),
+            "tag": "DESIGN-DETAIL", "quote": _context(text, m.start(), m.end()),
+            "problem": f"В требовании названо внутреннее имя компонента реализации «{m.group(0)}» — это решение "
+                       "проектирования, а не требование к поведению системы.",
+            "recommendation": "Убрать имя компонента из требований (перенести в техническое описание) или указать, "
+                              "почему это внешнее ограничение.",
         })
     for m in TIME_RE.finditer(text):
         if PERCENTILE_RE.search(text):
@@ -260,6 +276,7 @@ def _ctx_line(text: str, m: re.Match, words: int = 4) -> str:
 
 _NAME_COL = re.compile(r"^(parameter|param|field|name|attribute|параметр|поле|атрибут|наименование|имя)\w*$", _I)
 _TYPE_COL = re.compile(r"^(format|type|data\s*type|формат|тип(\s+данных)?)$", _I)
+_STORE_COL = re.compile(r"^(db\s*field|db\s*column|column|поле\s+(бд|бaзы\s+данных)|колонка(\s+бд)?|столбец\s+бд)$", _I)
 
 
 def _cells(text: str) -> list[str] | None:
@@ -269,9 +286,9 @@ def _cells(text: str) -> list[str] | None:
     return [c.strip().strip("`*").strip() for c in t[1:-1].split("|")]
 
 
-def _param_rows(lines) -> list[tuple[str, str, object]]:
+def _param_rows(lines, with_store: bool = False) -> list[tuple]:
     """Строки таблиц, у которых есть колонка имени поля и колонка типа/формата:
-    (имя поля, нормализованный тип, строка)."""
+    (имя поля, нормализованный тип, строка[, значение колонки хранения — «DB field»])."""
     out, cols = [], None
     for ln in lines:
         cells = _cells(ln.text)
@@ -283,12 +300,14 @@ def _param_rows(lines) -> list[tuple[str, str, object]]:
         ni = next((i for i, c in enumerate(cells) if _NAME_COL.match(c)), None)
         ti = next((i for i, c in enumerate(cells) if _TYPE_COL.match(c)), None)
         if ni is not None and ti is not None:
-            cols = (ni, ti)
+            si = next((i for i, c in enumerate(cells) if _STORE_COL.match(c)), None)
+            cols = (ni, ti, si)
             continue
-        if cols and len(cells) > max(cols):
+        if cols and len(cells) > max(c for c in cols if c is not None):
             name, fmt = cells[cols[0]], cells[cols[1]].lower()
+            store = cells[cols[2]].strip("`") if cols[2] is not None and cols[2] < len(cells) else ""
             if name and fmt and fmt not in {"—", "-"} and len(name) <= 64:
-                out.append((name, fmt, ln))
+                out.append((name, fmt, ln, "" if store in {"—", "-"} else store) if with_store else (name, fmt, ln))
     return out
 
 
@@ -330,6 +349,7 @@ def _schema_vs_examples(lines):
     """По направлениям (запрос / ответ): поля таблиц-схем и JSON-примеры, найденные под заголовками этого
     направления. Направление задаёт ближайший заголовок («Ответ», «Статусы», «200 …» — ответ; «Запрос»,
     «Query-параметры», «Request body» — запрос)."""
+    _schema_vs_examples.last = {}       # таблицы по направлениям с колонкой хранения (для правила 4г)
     direction, level = None, 0
     tagged = []
     for ln in lines:
@@ -347,6 +367,8 @@ def _schema_vs_examples(lines):
         rows = {}
         for name, fmt, ln in _param_rows(sub):
             rows.setdefault(name.strip("`"), (fmt, ln))
+        if rows:
+            _schema_vs_examples.last[d] = {n: (f, ln, st) for n, f, ln, st in _param_rows(sub, with_store=True)}
         examples = []
         for ln in sub:
             t = ln.text.strip()
@@ -516,6 +538,50 @@ def check_document(doc) -> list[dict]:
                                   "решает владелец API.",
             })
 
+    # 4г. Одно и то же поле хранения (колонка «DB field») передаётся в запросе и в ответе разными типами.
+    # Само по себе различие типов запроса и ответа — не дефект (R08); здесь есть доказательство, что это ОДНО
+    # значение: обе таблицы ссылаются на одно поле хранения. Это несогласованность модели данных, а не
+    # противоречие: если различие намеренное, его нужно описать.
+    rq, rs = _schema_vs_examples.last.get("req") or {}, _schema_vs_examples.last.get("resp") or {}
+    same = []
+    for name, (f1, ln1, st1) in rq.items():
+        if name in rs:
+            f2, ln2, st2 = rs[name]
+            k1, k2 = _schema_kind(f1), _schema_kind(f2)
+            if k1 and k2 and k1 != k2 and st1 and st1 == st2:
+                same.append((name, f1, f2, ln1, ln2, st1))
+    if same:
+        locs = []
+        for _, _, _, ln1, ln2, _ in same[:4]:
+            locs += [(ln1.gid, collapse(ln1.text)), (ln2.gid, collapse(ln2.text))]
+        out.append({
+            "type": "Несогласованность", "criterion": "S-CONS", "severity": "major", "tag": "DATA-TYPE",
+            "locs": locs,
+            "problem": "Одно и то же значение передаётся в запросе и в ответе разными типами (" + "; ".join(
+                f"«{n}»: в запросе {a}, в ответе {b}, оба — поле хранения «{st}»" for n, a, b, _, _, st in same[:4])
+                       + "). Документ не объясняет преобразование, поэтому клиент и сервер могут по-разному "
+                         "сериализовать и сравнивать значение.",
+            "recommendation": "Указать единый тип для каждого такого поля или явно описать правило преобразования "
+                              "между запросом и ответом; выбор — за владельцем API.",
+        })
+
+    # 4д. Контракт API описывает схему хранения (колонка «DB field»): требования привязаны к реализации
+    store_tables = []
+    for ln in lines:
+        cells = _cells(ln.text)
+        if cells and any(_STORE_COL.match(c) for c in cells) and any(_NAME_COL.match(c) for c in cells):
+            store_tables.append(ln)
+    if store_tables:
+        out.append({
+            "type": "Детали реализации", "criterion": "S-MOD", "severity": "minor", "tag": "DESIGN-DETAIL",
+            "locs": [(ln.gid, collapse(ln.text)) for ln in store_tables[:4]],
+            "problem": f"Таблицы параметров ({len(store_tables)}) содержат колонку с полями хранения (схема БД): "
+                       "контракт интерфейса привязан к внутренней реализации, и любое изменение хранения "
+                       "потребует правки требований.",
+            "recommendation": "Перенести соответствие полей и колонок хранения в техническое описание реализации; "
+                              "в требованиях оставить имена, типы и правила полей интерфейса.",
+        })
+
     # 5. Заголовок Content-Type при отсутствии тела
     ct = find(r"Content-Type[^a-z]*application/json")
     nobody = find(r"Тело\s+не\s+использ\w*|body\s+is\s+not\s+used")
@@ -560,3 +626,6 @@ WHY_CRITICAL = {
         "closure": "Раздел кода 200 содержит только успешный ответ; для каждой ошибки указан свой код и пример.",
     },
 }
+
+
+_schema_vs_examples.last = {}

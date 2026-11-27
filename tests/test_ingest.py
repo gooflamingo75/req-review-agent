@@ -171,14 +171,15 @@ def test_full_report_pdf_and_links():
     with pymupdf.open(str(files["pdf"])) as d:
         text = "".join(p.get_text() for p in d)
         assert "Вердикт" in d[0].get_text() and "Исходный текст" in text and "₸" in text
-        assert "План исправлений по ролям" in d[1].get_text() or "План исправлений по ролям" in d[2].get_text()
+        assert "1. Паспорт прогона" in d[1].get_text(), "после обложки — разделы шаблона"
         links = [lk for p in d for lk in p.get_links() if lk.get("kind") == pymupdf.LINK_GOTO]
         assert links and all(0 <= lk["page"] < d.page_count for lk in links)
         assert d.get_toc()
     md = files["md"].read_text(encoding="utf-8")
-    order = ["## Вердикт", "План исправлений по ролям", "## Вопросы к аналитику и тест-кейсы", "# Приложения",
-             "Приложение А. Паспорт", "Приложение В. Детальная", "Приложение Е. Полная матрица",
-             "Приложение Ж. Критерии и методика", "Приложение К. Исходный текст"]
+    order = ["## Вердикт", "## 1. Паспорт прогона", "## 2. Нарезка и инвентаризация", "## 3. Детальная проверка",
+             "## 4. Проверка набора", "## 5. Сводная статистика", "## 6. Итоговый вердикт", "План исправлений по ролям",
+             "Вопросы к аналитику", "Тест-кейсы", "# Приложения", "Приложение А. Полная матрица",
+             "Приложение Б. Критерии и методика", "Приложение Д. Исходный текст"]
     pos = [md.index(x) for x in order]
     assert pos == sorted(pos), list(zip(order, pos))
     # каждая строка исходного файла есть в приложении

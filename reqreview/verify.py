@@ -124,6 +124,17 @@ def critic(doc, reqs, set_findings, llm, doc_text: str, prompts_mod, warnings: l
             hit = doc.find(ev) if ev and len(ev) >= 12 else None
             if not hit:
                 continue
+            # вопрос задан именно к тексту этого правила: цитата из самого правила на него не отвечает
+            # (иначе вопрос не возник бы) — нужен ответ из другого места документа
+            about = set()
+            if rid.startswith("EC-") and rid[3:].isdigit() and 0 < int(rid[3:]) <= len(edge_cases):
+                about = set(edge_cases[int(rid[3:]) - 1].get("req_ids") or [])
+            elif rid in qmap:
+                about = {qmap[rid][0].id}
+            own_lines = {g for r_ in reqs if r_.id in about and r_.g1 is not None
+                         for g in range(r_.g1, (r_.g2 or r_.g1) + 1)}
+            if set(range(hit[1], hit[2] + 1)) <= own_lines:
+                continue
             if rid.startswith("EC-") and rid[3:].isdigit() and 0 < int(rid[3:]) <= len(edge_cases):
                 e = edge_cases[int(rid[3:]) - 1]
                 answered_ec.add(int(rid[3:]) - 1)

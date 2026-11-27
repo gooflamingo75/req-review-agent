@@ -297,6 +297,7 @@ def test_gemini_fast_failover():
                 raise Err(404)
             return type("R", (), {"text": '{"ok": 1}'})()
 
+    L.PRIMARY_RETRY_SEC = 0.3
     g = L.GeminiLLM("k", model="main", min_interval=0.0, fallbacks=["gone", "backup"])
     g.client = type("C", (), {"models": Models()})()
     t0 = _t.monotonic()
@@ -307,6 +308,7 @@ def test_gemini_fast_failover():
     assert "gone" in g.dead and g.used == {"backup": 6}
     assert g.client.models.log.count("main") <= 4, "перегруженная основная модель пропускается"
     assert g.primary_share() == 0
+    assert "перегрузка" in g.failure_summary() and "404" in g.failure_summary("gone"), "причины отказов сохраняются"
 
 
 if __name__ == "__main__":

@@ -70,6 +70,8 @@ def main(argv=None) -> int:
                    "обращения к модели; input — тот же документ (для приложения «Исходный текст»)")
     p.add_argument("--compare", dest="compare", help="сравнить с предыдущим прогоном (путь к его .json): "
                    "в отчёте появится блок «Что изменилось» — закрытые, новые и оставшиеся дефекты")
+    p.add_argument("--primary-only", action="store_true",
+                   help="только основная модель (GEMINI_MODEL): при перегрузке ждать её, а не переходить на резервные")
     a = p.parse_args(argv)
     a.input = a.input_opt or a.input
     a.output = a.output_opt or a.output or "reports/report.md"
@@ -157,6 +159,13 @@ def main(argv=None) -> int:
                 max_retries=int(os.getenv("MAX_RETRIES", "6")),
                 fallbacks=[m for m in os.getenv("GEMINI_FALLBACK_MODELS", "").split(",") if m.strip()] or None,
             )
+            llm.primary_only = a.primary_only or os.getenv("GEMINI_PRIMARY_ONLY", "").strip().lower() in ("1", "true", "yes")
+            print(f"Проверяю основную модель {llm.primary}…", file=sys.stderr)
+            llm.probe_note = llm.probe()
+            if llm.probe_note:
+                print(f"   ! {llm.probe_note}", file=sys.stderr)
+                if llm.primary_only and llm.primary in llm.dead:
+                    raise LLMError(llm.probe_note)
         print(f"Модель: {llm.name}", file=sys.stderr)
         batch = a.batch_size or int(os.getenv("BATCH_SIZE", "8"))
         result = run(doc, llm, batch_size=max(1, batch))

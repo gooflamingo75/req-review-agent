@@ -761,10 +761,16 @@ def run(doc: Document, llm, batch_size: int = 8) -> Result:
     }
     share = llm.primary_share() if hasattr(llm, "primary_share") else None
     stats["primary_share"] = round(share, 2) if share is not None else None
+    stats["model_failures"] = dict(getattr(llm, "failures", {}) or {})
     if share is not None and share < 0.5:
-        warnings.append(f"Основная модель {stats['primary_model']} обработала только {round(share * 100)}% запросов "
-                        "(остальные — резервные модели из-за перегрузки сервиса): качество анализа может быть ниже; "
-                        "рекомендуется повторный запуск.")
+        why = llm.failure_summary() if hasattr(llm, "failure_summary") else ""
+        note = getattr(llm, "probe_note", None)
+        warnings.append(f"Основная модель {stats['primary_model']} обработала только {round(share * 100)}% запросов; "
+                        "остальные — резервные модели. "
+                        + (f"Причина по ответам сервиса: {why}. " if why else "")
+                        + (f"Проверка перед стартом: {note}. " if note else "")
+                        + "Качество анализа может быть ниже: повторите запуск позже или с флагом --primary-only "
+                          "(ждать основную модель вместо перехода на резервные).")
     csum = cov.summary()
     status, reasons = run_status(doc.ingest, csum, len(reqs), sum(1 for r in reqs if r.reviewed), llm.model == "mock")
     stats["affected_reqs"] = stats["with_issues"]

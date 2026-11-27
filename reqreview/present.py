@@ -440,18 +440,17 @@ def build(data: dict, doc=None, include_source: bool = True) -> Out:
     if data.get("findings") is None and not v.reqs and v.status == "failed":
         _diagnostic(v, o)
     else:
-        _page_decisions(v, o)          # стр. 1: вердикт, ценность, решения до старта
+        _page_decisions(v, o)          # обложка: вердикт, ценность, решения до старта
         o.pagebreak()
-        _fixlist(v, o)                 # стр. 2–3: план исправлений по ролям
-        o.pagebreak()
-        _questions_tests(v, o)         # стр. 4: вопросы к аналитику и тест-кейсы
-        o.pagebreak()
-        o.h(1, "Приложения", "appendix")
-        _passport(v, o)
+        _passport(v, o)                # далее — разделы 1–6 строго по шаблону организаторов
         _inventory(v, o)
         _requirements(v, o)
         _set(v, o)
         _stats(v, o)
+        o.pagebreak()
+        _verdict(v, o)                 # 6: вердикт, план по ролям, вопросы, тест-кейсы
+        o.pagebreak()
+        o.h(1, "Приложения", "appendix")
         _appendices(v, o)
     if include_source and doc is not None:
         _source_md(doc, o)
@@ -579,16 +578,18 @@ def _page_decisions(v: View, o: Out):
                 [5, 51, 24, 11, 9], "dec")
     else:
         o.h(2, "Решений, блокирующих разработку, нет", "decisions")
-    o.p("Далее: [план исправлений по ролям](#fixes) · [вопросы и тест-кейсы](#qa) · "
-        "[приложения](#appendix) — паспорт прогона, детали по каждому требованию, матрица критериев, методика, "
-        "исходный текст.", "note")
+    o.p("Отчёт по шаблону: [1. Паспорт прогона](#passport) · [2. Нарезка требований](#inventory) · "
+        "[3. Проверка каждого требования](#requirements) · [4. Проверка набора](#set) · [5. Статистика](#stats) · "
+        "[6. Итоговый вердикт](#verdict) — в нём [план исправлений по ролям](#fixes), "
+        "[вопросы к аналитику](#questions) и [тест-кейсы](#tests). [Приложения](#appendix) — матрица критериев, "
+        "методика, журнал проверки, исходный текст.", "note")
 
 
 # ---------------------------------------------------------------- стр. 2–3: план исправлений
 def _fixlist(v: View, o: Out):
     from .records import ROLES
     plan = v.d.get("plan") or []
-    o.h(2, "План исправлений по ролям", "fixes")
+    o.h(3, "6.3. План исправлений по ролям", "fixes")
     rows_total = 0
     by_role: dict[str, dict] = {k: {} for k, _, _ in ROLES}
     for a in plan:                      # строки — по требованию (для чтения), действия — каждое отдельно
@@ -603,7 +604,7 @@ def _fixlist(v: View, o: Out):
         groups = by_role[key]
         if not groups:
             continue
-        o.h(3, f"{name} — {scope}", f"fix-{key}")
+        o.h(4, f"{name} — {scope}", f"fix-{key}")
         rows = []
         for k, acts in sorted(groups.items(), key=lambda kv: (min(SEV_ORDER[a["severity"]] for a in kv[1]),
                                                               kv[0])):
@@ -617,16 +618,15 @@ def _fixlist(v: View, o: Out):
         o.table(["#", "Приоритет", "Что сделать", "Дефекты", "Требования"], rows, [4, 11, 55, 14, 16])
     recs = v.d.get("recommendations") or []
     if recs:
-        o.h(3, "Рекомендации (не дефекты, по желанию)", "fix-recs")
+        o.h(4, "Рекомендации (не дефекты, по желанию)", "fix-recs")
         o.table(["#", "Рекомендация", "Где"], [[str(i), v.clean(r_["text"]), r_.get("where") or "—"]
                                               for i, r_ in enumerate(recs, 1)], [5, 75, 20])
 
 
 # ---------------------------------------------------------------- стр. 4: вопросы и тест-кейсы
 def _questions_tests(v: View, o: Out):
-    o.h(2, "Вопросы к аналитику и тест-кейсы", "qa")
     qs = v.d.get("questions") or []
-    o.h(3, "Вопросы к аналитику", "questions")
+    o.h(3, "6.4. Вопросы к аналитику", "questions")
     if qs:
         o.table(["#", "Вопрос", "Откуда"],
                 [[q["id"], q["text"] + (f" (решение {', '.join(q['decisions'])})" if q.get("decisions") else ""),
@@ -635,7 +635,7 @@ def _questions_tests(v: View, o: Out):
     else:
         o.p("Открытых вопросов нет.")
     tests = v.d.get("tests") or []
-    o.h(3, "Тест-кейсы (идеи для QA)", "tests")
+    o.h(3, "6.5. Тест-кейсы (идеи для QA)", "tests")
     if tests:
         o.table(["#", "Что проверить (исходные данные → ожидаемый результат)", "Требование"],
                 [[t["id"], v.clean(t["text"]) + (f"\n⚠ Условный: ожидаемый результат зависит от решения "
@@ -647,6 +647,27 @@ def _questions_tests(v: View, o: Out):
                    "открытых решений с первой страницы: до решения ожидаемый результат — условный.")
     else:
         o.p("Идей тест-кейсов не сформировано.")
+
+
+def _verdict(v: View, o: Out):
+    """Раздел 6 шаблона: вердикт, решения, план по ролям, вопросы и тест-кейсы."""
+    o.h(2, "6. Итоговый вердикт и первоочередные рекомендации", "verdict")
+    head, kind = _headline(v)
+    o.h(3, "6.1. Вердикт", "verdict-text")
+    if v.status != "completed":
+        head += " Статус проверки: " + RUN.get(v.status, (v.status,))[0] + " — вывод относится к проверенной части."
+    o.callout(head, kind if kind in ("warn", "fail", "ok") else "info")
+    ds = _decisions(v)
+    o.h(3, "6.2. Решения до старта разработки", "verdict-decisions")
+    if ds:
+        o.table(["#", "Что решить", "Кто решает", "Дефекты"],
+                [[d["id"], d["question"], d["owner"], ", ".join(v.flink(x) for x in d["findings"])] for d in ds],
+                [7, 63, 15, 15])
+        o.note("Варианты и влияние на бизнес — на [первой странице](#decisions).")
+    else:
+        o.p("Решений, блокирующих разработку, нет.")
+    _fixlist(v, o)
+    _questions_tests(v, o)
 
 
 def _dropped_count(v: View) -> int:
@@ -674,7 +695,7 @@ def _model_line(v: View) -> str:
 def _passport(v: View, o: Out):
     doc = v.d.get("document") or {}
     ing = v.ing
-    o.h(2, "Приложение А. Паспорт прогона и объём проверки", "passport")
+    o.h(2, "1. Паспорт прогона", "passport")
     o.kv([("Документ", f"«{doc.get('title', '')}» · `{doc.get('file', '')}`"),
           ("Дата и время прогона", (v.d.get("date") or "").replace("T", " ")),
           ("Модель", _model_line(v)),
@@ -682,12 +703,19 @@ def _passport(v: View, o: Out):
           ("Время анализа", f"{v.d.get('duration_sec', 0):.0f} сек"),
           ("SHA-256 документа", f"`{doc.get('sha256', '')}`"),
           ("Стандарты", "ISO/IEC/IEEE 29148:2018 п. 5.2.5, 5.2.6; IEEE Std 830-1998 п. 4.3; руководство "
-                        "организаторов (см. Приложение Ж)")])
+                        "организаторов (см. Приложение Б)")])
     share = (v.stats or {}).get("primary_share")
     if share is not None and share < 0.5:
-        o.callout(f"Основная модель обработала только {round(share * 100)}% запросов (остальные — резервные модели "
-                  "из-за перегрузки сервиса). Глубина анализа может быть ниже; рекомендуется повторный запуск.", "warn")
-    o.h(3, "А.1. Что прочитано и проверено", "scope-detail")
+        st = v.stats or {}
+        fails = (st.get("model_failures") or {}).get(st.get("primary_model") or "") or {}
+        why = ", ".join(f"{k} ×{n}" for k, n in sorted(fails.items(), key=lambda x: -x[1]))
+        o.callout(f"Основная модель {st.get('primary_model') or ''} обработала только {round(share * 100)}% запросов, "
+                  "остальные выполнили резервные модели. "
+                  + (f"Почему (ответы сервиса): {why}. " if why else
+                     "Причина отказов в этом прогоне не сохранена (отчёт создан версией агента до 3.6). ")
+                  + "Глубина анализа может быть ниже. Повторите запуск позже или с флагом `--primary-only` — агент "
+                    "будет ждать основную модель, а не переходить на резервные.", "warn")
+    o.h(3, "1.1. Что прочитано и проверено", "scope-detail")
     st_label, st_cls = RUN.get(v.status, (v.status, "na"))
     checks = v.cov.get("checks") or []
     done = sum(1 for c in checks if c["status"] == "выполнена")
@@ -698,7 +726,7 @@ def _passport(v: View, o: Out):
     dropped = len(v.d.get("dropped") or []) or _dropped_count(v)
     if dropped:
         o.note(f"Самопроверка: второй ревьюер отклонил {dropped} {plural(dropped, 'кандидат', 'кандидата', 'кандидатов')} "
-               "в дефекты как ложные срабатывания (см. [Приложение З](#app-b)); повторы одной первопричины объединены "
+               "в дефекты как ложные срабатывания (см. [Приложение В](#app-b)); повторы одной первопричины объединены "
                f"({(v.stats or {}).get('merged', 0)}). Все цитаты сверены с текстом документа.")
     _scope_table(v, o)
     issues = ing.get("issues") or []
@@ -732,7 +760,7 @@ def _scope_table(v: View, o: Out):
 
 
 def _inventory(v: View, o: Out):
-    o.h(2, "Приложение Б. Нарезка и инвентаризация требований", "inventory")
+    o.h(2, "2. Нарезка и инвентаризация требований", "inventory")
     no_id = sum(1 for r in v.reqs if not r.get("doc_id"))
     kinds = Counter(r.get("kind") for r in v.reqs)
     o.p(f"Выделено **{len(v.reqs)}** элементарных требований"
@@ -787,17 +815,17 @@ def _finding_card(v: View, o: Out, f: dict, with_reqs=True):
 
 
 def _requirements(v: View, o: Out):
-    o.h(2, "Приложение В. Детальная проверка требований", "requirements")
+    o.h(2, "3. Детальная проверка каждого требования", "requirements")
     issues = [r for r in v.reqs if r.get("findings") or r.get("related") or r.get("questions")
               or any(st in ("warn", "fail") for st in (r.get("criteria") or {}).values())]
     systemic_only = [r for r in v.reqs if r not in issues and r.get("systemic_defects")]
     clean_n = len(v.reqs) - len(issues) - len(systemic_only)
     o.p(f"**{clean_n}** {plural(clean_n, 'требование соответствует', 'требования соответствуют', 'требований соответствуют')} "
-        f"всем критериям — подробно не описываются (см. [Приложение Б](#inventory) и полную матрицу в "
-        f"[Приложении Е](#app-matrix)). Ниже — только требования с замечаниями: **{len(issues)}** с собственными "
+        f"всем критериям — подробно не описываются (см. [раздел 2](#inventory) и полную матрицу в "
+        f"[Приложении А](#app-matrix)). Ниже — только требования с замечаниями: **{len(issues)}** с собственными "
         f"дефектами или вопросами и **{len(systemic_only)}** только с системными дефектами набора.")
     if issues:
-        o.h(3, "В.1. Матрица по критериям (требования с замечаниями)")
+        o.h(3, "3.1. Матрица по критериям (требования с замечаниями)")
         codes = list(INDIVIDUAL)
         rows = []
         for r in issues + systemic_only:
@@ -806,7 +834,7 @@ def _requirements(v: View, o: Out):
         o.table(["Требование"] + codes, rows, None, "mx")
         o.note("✓ выполнен · ! замечание · ✗ нарушение · · неприменим. Коды: " + "; ".join(
             f"{c} — {INDIVIDUAL[c][0]}" for c in codes) + ".")
-        o.h(3, "В.2. Требования с собственными замечаниями")
+        o.h(3, "3.2. Требования с собственными замечаниями")
         for r in issues:
             cr = r.get("criteria") or {}
             own_c = {f.get("criterion") for f in r.get("findings") or []}
@@ -830,23 +858,23 @@ def _requirements(v: View, o: Out):
             if r.get("questions"):
                 o.p("**Вопросы к аналитику:** " + " ".join(r["questions"]))
     if systemic_only:
-        o.h(3, "В.3. Требования, затронутые только системными дефектами")
+        o.h(3, "3.3. Требования, затронутые только системными дефектами")
         groups: dict[tuple, list[str]] = {}
         for r in systemic_only:
             groups.setdefault(tuple(r["systemic_defects"]), []).append(r["id"])
-        o.table(["Требования", "Системные дефекты (описаны в Приложении Г)"],
+        o.table(["Требования", "Системные дефекты (описаны в разделе 4)"],
                 [[v.refs(ids), ", ".join(f"{v.flink(s)} — {short(v.clean(v.by_fid[s]['problem']), 90)}"
                                          for s in key if s in v.by_fid)] for key, ids in groups.items()], [30, 70])
 
 
-SET_GROUPS = [("Г.1. Системная полнота", ["S-COMPL", "S-RANK"]),
-              ("Г.2. Взаимная непротиворечивость", ["S-CONS", "S-COMP"]),
-              ("Г.3. Архитектурная осуществимость и стандарты", ["S-FEAS", "S-BND"]),
-              ("Г.4. Прослеживаемость и модифицируемость", ["S-TRC", "S-MOD"])]
+SET_GROUPS = [("4.1. Системная полнота", ["S-COMPL", "S-RANK"]),
+              ("4.2. Взаимная непротиворечивость", ["S-CONS", "S-COMP"]),
+              ("4.3. Архитектурная осуществимость и стандарты", ["S-FEAS", "S-BND"]),
+              ("4.4. Прослеживаемость и модифицируемость", ["S-TRC", "S-MOD"])]
 
 
 def _set(v: View, o: Out):
-    o.h(2, "Приложение Г. Проверка набора требований в целом", "set")
+    o.h(2, "4. Проверка набора требований в целом", "set")
     sc = v.d.get("set_criteria") or {}
     rows = []
     for c, val in sc.items():
@@ -874,7 +902,7 @@ def _set(v: View, o: Out):
             for f in minors:
                 o.html(f'<p id="{f["id"]}" style="margin:0"></p>')
     ec = v.d.get("edge_cases") or []
-    o.h(3, "Г.5. Непокрытые пограничные сценарии", "edge")
+    o.h(3, "4.5. Непокрытые пограничные сценарии", "edge")
     if ec:
         o.p("Документ не определяет поведение в этих сценариях. Это вопросы к аналитику, а не дефекты.")
         o.table(["№", "Сценарий", "Требования", "Риск", "Вопрос"],
@@ -882,14 +910,14 @@ def _set(v: View, o: Out):
                   e.get("question") or "—"] for i, e in enumerate(ec, 1)], [6, 24, 14, 28, 28])
     else:
         o.p("Дополнительных пограничных сценариев не выделено.")
-    o.p("Матрица прослеживаемости (цель → UI → требование → API/данные → приёмка) — в [Приложении Е](#app-matrix).",
+    o.p("Матрица прослеживаемости (цель → UI → требование → API/данные → приёмка) — в [Приложении А](#app-matrix).",
         "note")
 
 
 def _stats(v: View, o: Out):
     s = v.stats
     bs = s.get("by_severity") or {}
-    o.h(2, "Приложение Д. Сводная статистика", "stats")
+    o.h(2, "5. Сводная статистика проведённого аудита", "stats")
     req_sev = Counter(f["severity"] for f in v.req_f)
     set_sev = Counter(f["severity"] for f in v.set_f)
     rows = [[f"{SEV[k][0]} ({k})", str(req_sev.get(k, 0)), str(set_sev.get(k, 0)),
@@ -911,7 +939,7 @@ def _stats(v: View, o: Out):
 
 
 def _appendices(v: View, o: Out):
-    o.h(2, "Приложение Е. Полная матрица критериев и прослеживаемость", "app-matrix")
+    o.h(2, "Приложение А. Полная матрица критериев и прослеживаемость", "app-matrix")
     codes = list(INDIVIDUAL)
     o.table(["Требование"] + codes, [[r["id"]] + [("{" + (r.get("criteria") or {}).get(c, "na") + "}"
                                                    + MARK[(r.get("criteria") or {}).get(c, "na")]) for c in codes]
@@ -922,7 +950,7 @@ def _appendices(v: View, o: Out):
         o.table(["Требование", "Цель", "UI/UX", "API / данные", "Приёмка", "Разрыв"],
                 [[v.ref(t["req"]), cell(t["goal"]), cell(t["ui"]), cell(t["api_data"]), cell(t["acceptance"]),
                   v.clean(t.get("gap") or "—")] for t in tr], [14, 10, 10, 14, 12, 40])
-    o.h(2, "Приложение Ж. Критерии и методика", "app-a")
+    o.h(2, "Приложение Б. Критерии и методика", "app-a")
     o.table(["Код", "Критерий", "Источник"], [[c, n, s] for c, (n, s, _) in INDIVIDUAL.items()]
             + [[c, n, s] for c, (n, s, _) in SET.items()], [10, 45, 45])
     o.p("**Критичность:** " + " ".join(x.strip() for x in CRITICAL_HINT.split("\n")))
@@ -933,9 +961,9 @@ def _appendices(v: View, o: Out):
         "покрытия и статуса кодом.")
     o.note("Символ — кодовая точка Unicode извлечённого текста, включая пробелы и переводы строк; метки строк, "
            "промпты и текст отчёта не считаются. 100% — покрытие извлечённого текста, а не всего файла, если в "
-           "Приложении А.1 есть нечитаемые части.")
+           "разделе 1.1 есть нечитаемые части.")
     _comparison_block(v, o, full=True)
-    o.h(2, "Приложение З. Журнал проверки", "app-b")
+    o.h(2, "Приложение В. Журнал проверки", "app-b")
     o.bullets(list(dict.fromkeys(v.d.get("warnings") or [])) or ["Предупреждений нет."])
     vd = v.d.get("validation") or {}
     if vd.get("checks"):
@@ -950,7 +978,7 @@ def _appendices(v: View, o: Out):
                 [[d_["where"], short(d_["problem"], 200), d_.get("reason") or "—", d_.get("evidence") or "—"]
                  for d_ in dropped], [12, 40, 24, 24])
     if v.cov:
-        o.h(2, "Приложение И. Приём документа и покрытие", "app-c")
+        o.h(2, "Приложение Г. Приём документа и покрытие", "app-c")
         pages = v.ing.get("pages") or []
         if v.ing.get("fmt") == "PDF" and pages:
             from .ingest import METHOD_RU, PAGE_RU
@@ -1000,7 +1028,7 @@ def _source_md(doc, o: Out):
             lines.append(f"===== с. {cur} =====")
         lines.append(f"L{ln.gid:04d}{' OCR' if ln.src == 'ocr' else '    '} │ {ln.text}")
     lines.append("```")
-    title = "Приложение К. Исходный текст (канонический транскрипт)"
+    title = "Приложение Д. Исходный текст (канонический транскрипт)"
     o.html(source_html(doc, title).replace('<h2 id="source">', '<h2 id="source">'),
            f"## {title}\n\nСтроки исходного документа с номерами; на них ссылаются все места в отчёте.\n\n"
            + "\n".join(lines) + "\n")

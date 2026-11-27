@@ -129,8 +129,8 @@ def _reset_data():
                           "owner": "Владелец продукта"})
     s3 = _f("S-03", "MAJOR", "Метод сохранения порога объявлен как GET.", "Заменить метод на POST.",
             tag="REST-METHOD", reqs=["REQ-05"], lines=[50], crit="S-FEAS")
-    s4 = _f("S-04", "MAJOR", "Не задано, сбрасывается ли накопленная сумма трат при смене месяца для карт.",
-            "Описать сброс накопленной суммы трат при смене месяца.", reqs=["REQ-01"], lines=[11], crit="S-COMPL")
+    s4 = _f("S-04", "MAJOR", "Не описано, какую сумму трат показывает экран после смены месяца.",
+            "Описать отображение на экране.", reqs=["REQ-01"], lines=[11], crit="S-COMPL")
     reqs = [_req("REQ-01", 10, tests=["Траты 400 000 ₸, затем 200 000 ₸ → push?"]),
             _req("REQ-02", 20), _req("REQ-03", 30), _req("REQ-04", 40),
             _req("REQ-05", 50, tests=["POST сохраняет порог → 201"])]
@@ -190,6 +190,53 @@ def test_r07_reference_point_present_is_not_claimed_missing():
 # R08/R09 — в tests/test_pipeline.py::test_data_type_and_nfr_rules
 
 
+# ---------------------------------------------------------------- одна проблема на двух уровнях (аудит v8)
+def test_same_problem_in_set_and_requirements_is_one_defect():
+    s1 = _f("S-01", "CRITICAL", "Ошибка бизнес-проверки возвращается с HTTP 200 и телом result ERROR вместо 400.",
+            "Возвращать 400 для ошибок проверки.", tag="STATUS-200", reqs=["REQ-02"], lines=[20, 24], crit="S-CONS")
+    f1 = _f("F-001", "MAJOR", "Пример [L24] возвращает ERROR со статусом 200, хотя для неверных параметров "
+            "описан код 400.", "Перенести пример ERROR под код 400.", tag="CONTRADICTION", crit="CON")
+    f2 = _f("F-002", "MAJOR", "Неясно, какой код ответа означает успех.", "Описать коды успеха.", crit="UNA")
+    d = _data([_req("REQ-01", 24, findings=[f1, f2]), _req("REQ-02", 20)], [s1])
+    d = records.finalize(d)
+    assert [f["id"] for f in d["set_findings"]] == ["S-01"] and d["set_findings"][0]["places"] == 2
+    assert [f["id"] for f in d["requirements"][0]["findings"]] == ["F-001"], "второй дефект перенумерован"
+    assert "S-01" in d["requirements"][0]["systemic_defects"] and "REQ-01" in d["set_findings"][0]["requirements"]
+    assert len(d["decisions"]) == 1 and d["validation"]["status"] == "passed"
+
+
+def test_line_reference_moves_to_line_with_cited_fragment():
+    doc = _doc("# T\n\n200 OK\n\n{\"result\":\"OK\"}\n\n{\"result\":\"ERROR\"}\n")
+    ln = {l_.text: l_.gid for l_ in doc.lines}
+    ok, err = ln['{"result":"OK"}'], ln['{"result":"ERROR"}']
+    f = _f("F-001", "MAJOR", f"В примере [L{ok}] ответ с ERROR возвращается со статусом 200.", reqs=["REQ-01"])
+    g = _f("F-002", "MAJOR", f"Строки [L{ok}]-[L{err}] — примеры.", reqs=["REQ-01"])
+    d = _data([_req("REQ-01", ok, findings=[f, g])])
+    assert records.fix_line_refs(d, doc) == 1
+    assert f"[L{err}]" in d["requirements"][0]["findings"][0]["problem"]
+    assert d["requirements"][0]["findings"][1]["problem"] == g["problem"] or "[L" in g["problem"]
+
+
+def test_goal_statement_and_storage_details_are_minor():
+    r = _req("REQ-01", 3, findings=[_f("F-001", "MAJOR", "Цель «в момент покупки» неточна.", crit="UNA")])
+    r["kind"] = "контекст (цели/архитектура/схема)"
+    r2 = _req("REQ-02", 5, findings=[_f("F-002", "MAJOR", "Не указаны типы колонок.", "Указать VARCHAR(7) и BOOLEAN.")])
+    d = records.finalize(_data([r, r2]))
+    assert [f["severity"] for x in d["requirements"] for f in x["findings"]] == ["MINOR", "MINOR"]
+
+
+def test_request_response_same_storage_field_type_mismatch():
+    from reqreview.rules import check_document
+    doc = _doc("\n".join(["# API", "## Query-параметры", "| Parameter | Format | DB field |", "| --- | --- | --- |",
+                          "| `amount` | integer | `limit_kzt` |", "", "## Ответ", "| Parameter | Format | DB field |",
+                          "| --- | --- | --- |", "| `amount` | string | `limit_kzt` |"]))
+    hits = [h for h in check_document(doc) if h["tag"] == "DATA-TYPE"]
+    assert len(hits) == 1 and "limit_kzt" in hits[0]["problem"] and "противореч" not in hits[0]["problem"]
+    assert any(h["tag"] == "DESIGN-DETAIL" for h in check_document(doc))
+    from reqreview.rules import check_requirement
+    assert any(h.get("tag") == "DESIGN-DETAIL" for h in check_requirement("Запрос обрабатывает AlertsController."))
+
+
 # ---------------------------------------------------------------- R13: «реализуемо» — не нарушение
 def test_r13_positive_justification_is_not_a_violation():
     doc = _doc("# T\n\nСистема сохраняет порог.\n")
@@ -220,7 +267,7 @@ def test_r17_references_consistent_and_stats_recomputed():
 
 def test_r19_unrepairable_inconsistency_marks_report_partial():
     d = _reset_data()
-    d["set_findings"].append(dict(d["set_findings"][2]))                         # дубликат ID — ремонтом не чинится
+    d["set_findings"].append(_f("S-03", "MINOR", "Версия документа не указана.", "Указать версию."))  # дубль ID
     d = records.finalize(d)
     assert d["validation"]["status"] == "failed" and "V01" in d["validation"]["failed"]
     assert d["run_status"]["code"] == "partial"
@@ -264,3 +311,21 @@ def test_clarifications_and_recommendations_are_not_defects():
     _split_kinds([r], [], edge, recs)
     assert [f.problem for f in r.findings] == ["Нет числа."]
     assert r.questions == ["Какой часовой пояс используется?"] and recs[0]["text"] == "Добавить пример ответа."
+
+
+# ---------------------------------------------------------------- PDF: длинная таблица не теряет строк (аудит v8)
+def test_pdf_long_table_keeps_every_row():
+    import pymupdf
+
+    from reqreview.pdf import write_pdf_html
+    from reqreview.present import CSS
+    rows = "".join(f"<tr><td>TC-{i:02d}</td><td>{'Проверка суммы и статуса ответа. ' * (1 + i % 5)}</td>"
+                   f"<td>REQ-{i % 9:02d}<br/>строка {i}</td></tr>" for i in range(1, 61))
+    table = f'<table class=""><tr><th width="8%">#</th><th width="72%">Что</th><th width="20%">Где</th></tr>{rows}</table>'
+    out = Path(tempfile.mkdtemp()) / "t.pdf"
+    for n in range(0, 40, 3):
+        write_pdf_html("<p>строка</p>" * n + table, out, CSS, "t")
+        with pymupdf.open(str(out)) as d:
+            text = "".join(p.get_text() for p in d)
+        missing = [i for i in range(1, 61) if f"TC-{i:02d}" not in text]
+        assert not missing, (n, missing)

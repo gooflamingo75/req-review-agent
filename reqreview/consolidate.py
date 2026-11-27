@@ -18,9 +18,10 @@ from .criteria import SEVERITY_ORDER
 # Теги дефектов, которые по своей природе системные: одна первопричина — много мест
 SYSTEMIC_TAGS = {
     "REST-METHOD", "STATUS-200", "UNITS", "DATA-TYPE", "SECTION-EMPTY", "PLACEHOLDER",
-    "VERSIONING", "APPROVALS", "PRIORITY", "STRUCTURE", "ACCEPTANCE",
+    "VERSIONING", "APPROVALS", "PRIORITY", "STRUCTURE", "ACCEPTANCE", "DESIGN-DETAIL",
 }
 TAG_TITLES = {
+    "DESIGN-DETAIL": "Детали реализации в требованиях",
     "REST-METHOD": "HTTP-метод не соответствует характеру операции",
     "STATUS-200": "Ошибка возвращается под успешным HTTP-кодом",
     "UNITS": "Несогласованные единицы измерения",
@@ -204,7 +205,8 @@ def consolidate(reqs, set_findings, finding_cls, section_of=None):
             r0, f0 = items[0]
             host = finding_cls(criterion={"REST-METHOD": "S-FEAS", "STATUS-200": "S-FEAS", "UNITS": "S-CONS",
                                           "DATA-TYPE": "S-CONS", "FORMAT": "S-COMP", "PRIORITY": "S-RANK",
-                                          "TRACEABILITY": "S-TRC", "VERSIONING": "S-MOD"}.get(tag, "S-COMPL"),
+                                          "TRACEABILITY": "S-TRC", "VERSIONING": "S-MOD",
+                                          "DESIGN-DETAIL": "S-MOD"}.get(tag, "S-COMPL"),
                                severity=f0.severity, problem=f0.problem, recommendation=f0.recommendation,
                                type=TAG_TITLES.get(tag, "Системный дефект"), tag=tag, source=f0.source)
             host.merged = -1

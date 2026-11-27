@@ -41,8 +41,20 @@ def log(msg: str) -> None:
 # Порядок важен: сначала полноценные flash-модели, облегчённые «lite» — только в крайнем случае
 DEFAULT_GEMINI_FALLBACKS = ["gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
 OVERLOAD_COOLDOWN_SEC = 60.0     # перегруженная (503) модель пропускается столько секунд, затем пробуем снова
-OVERLOAD_COOLDOWN_MAX = 300.0    # при повторных перегрузках пауза растёт до этого предела
+OVERLOAD_COOLDOWN_MAX = 300.0
+PRIMARY_RETRY_SEC = 5.0          # перегрузка основной модели часто кратковременна: одна короткая пауза и повтор    # при повторных перегрузках пауза растёт до этого предела
 REQUEST_TIMEOUT_SEC = 240        # один запрос не может «висеть» дольше
+
+
+def _reason(code, e) -> str:
+    name = type(e).__name__.lower()
+    if code in (500, 502, 503, 504) or "unavailable" in str(e).lower() or "overloaded" in str(e).lower():
+        return f"{code or 503} перегрузка сервиса"
+    if "timeout" in name or "timed out" in str(e).lower() or "deadline" in str(e).lower():
+        return "тайм-аут ответа"
+    if isinstance(e, LLMError):
+        return "пустой ответ"
+    return f"{code or type(e).__name__} ошибка соединения"
 
 
 class GeminiLLM:
@@ -82,6 +94,52 @@ class GeminiLLM:
         self._lock = threading.Lock()
         self.calls = 0
         self.used: dict[str, int] = {}
+        self.failures: dict[str, dict[str, int]] = {}   # модель → причина отказа → сколько раз (для паспорта)
+        self.primary_only = False                         # True — не уходить на резервные модели
+        self.probe_note: str | None = None
+        self._retrying = False
+
+    def _fail(self, model: str, reason: str) -> None:
+        with self._lock:
+            d = self.failures.setdefault(model, {})
+            d[reason] = d.get(reason, 0) + 1
+
+    def failure_summary(self, model: str | None = None) -> str:
+        """«503 перегрузка ×4, тайм-аут ×2» — почему модель не ответила."""
+        d = self.failures.get(model or self.primary) or {}
+        return ", ".join(f"{k} ×{v}" for k, v in sorted(d.items(), key=lambda x: -x[1]))
+
+    def probe(self) -> str | None:
+        """Короткий пробный запрос к основной модели до начала проверки: недоступную модель (404, нет доступа
+        у ключа, дневной лимит) видно сразу, а не после прогона. Возвращает текст проблемы или None."""
+        types = self._types
+        cfg = types.GenerateContentConfig(temperature=0, response_mime_type="application/json")
+        last = ""
+        for wait in (0, 10, 25):
+            if wait:
+                log(f"   ! основная модель {self.primary} не ответила ({last}) — повтор через {wait} с…")
+                time.sleep(wait)
+            try:
+                self.client.models.generate_content(model=self.primary, contents='Ответь JSON: {"ok": true}',
+                                                    config=cfg)
+                return None
+            except Exception as e:  # noqa: BLE001
+                code = getattr(e, "code", None) or getattr(e, "status_code", None)
+                msg = str(e)
+                if code in (401, 403) or "API_KEY_INVALID" in msg or "PERMISSION_DENIED" in msg:
+                    return None                    # ключ проверит первый настоящий запрос с понятной ошибкой
+                if code == 404 or (code == 400 and "model" in msg.lower()):
+                    self._fail(self.primary, "404 модель недоступна для ключа")
+                    self._kill(self.primary, "недоступна (404)")
+                    return (f"основная модель {self.primary} недоступна для этого ключа (404) — укажите в .env "
+                            "GEMINI_MODEL, которая есть в вашем аккаунте (список: https://ai.google.dev/gemini-api/docs/models)")
+                if code == 429 and "PerDay" in msg:
+                    self._fail(self.primary, "дневной лимит исчерпан")
+                    self._kill(self.primary, "исчерпала дневной лимит бесплатного тарифа")
+                    return f"у основной модели {self.primary} исчерпан дневной лимит бесплатного тарифа"
+                last = f"{code or type(e).__name__}"
+                self._fail(self.primary, _reason(code, e))
+        return f"основная модель {self.primary} перегружена ({last}) — сейчас будут использоваться резервные модели"
 
     @property
     def model(self) -> str:
@@ -108,7 +166,8 @@ class GeminiLLM:
         раньше всех, и сколько её ждать."""
         now = time.monotonic()
         with self._lock:
-            alive = [m for m in self.models if m not in self.dead and m not in skip]
+            alive = [m for m in (self.models[:1] if self.primary_only else self.models)
+                     if m not in self.dead and m not in skip]
             if not alive:
                 return None, 0.0
             for m in alive:
@@ -130,6 +189,8 @@ class GeminiLLM:
             n = self.strikes.get(model, 0) + 1
             self.strikes[model] = n
             pause = min(OVERLOAD_COOLDOWN_SEC * (2 ** (n - 1)), OVERLOAD_COOLDOWN_MAX)
+            if model == self.models[0]:
+                pause = min(pause, OVERLOAD_COOLDOWN_SEC)   # основную модель пробуем снова не позже чем через 60 с
             self.cool[model] = time.monotonic() + pause
         log(f"   ! {model} перегружена ({code}) — запрос сразу ушёл на резервную модель; "
             f"{model} пропускается {pause:.0f} с")
@@ -150,6 +211,7 @@ class GeminiLLM:
         )
         attempt, last_err, rate_wait = 0, "", 5.0
         skip: set[str] = set()                     # модели, уже отказавшие в ЭТОМ запросе
+        primary_retry = True                       # основной модели — один быстрый повтор до резервной
         while attempt < self.max_retries * 3:
             model, wait = self._pick(skip)
             if model is None:
@@ -183,11 +245,13 @@ class GeminiLLM:
                 if code in (401, 403) or "API_KEY_INVALID" in msg or "PERMISSION_DENIED" in msg:
                     raise LLMError(f"Ключ отклонён ({code}). Проверьте GEMINI_API_KEY в .env. {msg[:300]}") from e
                 if code == 404 or (code == 400 and "model" in msg.lower() and "not" in msg.lower()):
+                    self._fail(model, "404 модель недоступна для ключа")
                     self._kill(model, "недоступна (404)")
                     continue
                 if code == 400:
                     raise LLMError(f"Запрос отклонён (400): {msg[:300]}") from e
                 if code == 429 and "PerDay" in msg:
+                    self._fail(model, "дневной лимит исчерпан")
                     self._kill(model, "исчерпала дневной лимит бесплатного тарифа")
                     continue
                 if code == 429:
@@ -195,10 +259,26 @@ class GeminiLLM:
                     m = re.search(r"retry(?:Delay)?['\"]?\s*[:=]?\s*['\"]?(\d+(?:\.\d+)?)s", msg, re.I)
                     w = min(float(m.group(1)) + 1, 60.0) if m else rate_wait
                     rate_wait = min(rate_wait * 2, 60.0)
+                    self._fail(model, "429 лимит в минуту")
                     log(f"   ! лимит запросов в минуту у {model} (429), жду {w:.0f} с…")
                     time.sleep(w)
                     continue
-                # 5xx, тайм-аут, обрыв соединения, пустой ответ — сразу пробуем следующую модель
+                # 5xx, тайм-аут, обрыв соединения, пустой ответ — пробуем следующую модель
+                self._fail(model, _reason(code, e))
+                with self._lock:                   # быстрый повтор — только одним запросом за раз
+                    first = model == self.models[0] and primary_retry and not self._retrying
+                    if first:
+                        self._retrying = True
+                if model == self.models[0] and (first or self.primary_only):
+                    primary_retry = False
+                    w = PRIMARY_RETRY_SEC if not self.primary_only else min(rate_wait * 2, 60.0)
+                    rate_wait = w
+                    log(f"   ! {model} не ответила ({code or type(e).__name__}) — повтор через {w:.0f} с…")
+                    time.sleep(w)
+                    if first:
+                        with self._lock:
+                            self._retrying = False
+                    continue
                 self._overloaded(model, code or type(e).__name__)
                 skip.add(model)
         raise LLMError(f"Не удалось получить ответ после {attempt} попыток: {last_err}")
