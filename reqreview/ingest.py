@@ -11,13 +11,11 @@ from __future__ import annotations
 import hashlib
 import os
 import re
-import tempfile
 import time
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .util import collapse_ws, norm
 
 SUPPORTED_EXT = {".pdf": "PDF", ".docx": "DOCX", ".md": "Markdown", ".markdown": "Markdown",
                  ".txt": "TXT", ".text": "TXT"}

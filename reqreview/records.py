@@ -325,8 +325,6 @@ def fix_line_refs(data: dict, doc) -> int:
     n = 0
 
     def fix(t: str) -> str:
-        nonlocal n
-
         def one(m):
             nonlocal n
             g = int(m.group(1))

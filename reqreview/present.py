@@ -13,7 +13,7 @@ import re
 from collections import Counter
 
 from .criteria import INDIVIDUAL, SET, CRITICAL_HINT
-from .util import collapse_ws, md_cell, short
+from .util import collapse_ws, short
 
 ACCENT = "#00ab75"          # BCC green
 SEV = {"CRITICAL": ("Блокер", "#c0392b"), "MAJOR": ("Существенный", "#d68910"), "MINOR": ("Замечание", "#7b8a8b")}

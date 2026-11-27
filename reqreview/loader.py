@@ -558,7 +558,6 @@ def _read_docx(data: bytes, ing, ocr, workdir: Path) -> tuple[list[Line], str]:
                 if not res.get("ok") and ing.ocr_state != "выполнен":
                     ing.ocr_state = "недоступен"
     if big_unread:
-        from .ocr import ERROR_RU
         ing.add(Issue("limitation", "ограничение инструмента", f"{big_unread} изобр. в теле документа",
                       f"В документе {big_unread} крупных изображений (схемы, скриншоты); текст на них не прочитан.",
                       recovery="OCR изображений", result=f"не выполнен: {ocr.describe()}" if not ocr.available

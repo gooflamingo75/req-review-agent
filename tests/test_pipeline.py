@@ -14,7 +14,7 @@ sys.path.insert(0, str(ROOT))
 from reqreview.agent import run  # noqa: E402
 from reqreview.llm import MockLLM, parse_json  # noqa: E402
 from reqreview.loader import load_document  # noqa: E402
-from reqreview.report import render  # noqa: E402
+from reqreview.report import to_json  # noqa: E402
 
 SAMPLE = ROOT / "examples" / "sample_requirements.md"
 
@@ -156,12 +156,16 @@ def test_scripted_pipeline():
                 assert any(f.criterion == c for f in r.findings) or r.linked or r.related, (r.id, c)
     r1b = next(r for r in res.requirements if r.doc_id == "КБ-1")
     assert r1b.criteria["CON"] == "fail" and any("противоречит" in t for t in r1b.test_ideas)
-    md = render(res, "test", "examples/sample_requirements.md")
-    for section in ("Паспорт прогона", "Нарезка и инвентаризация требований", "Детальная проверка каждого требования",
-                    "Проверка набора требований в целом", "Сводная статистика", "Итоговый вердикт",
-                    "Матрица прослеживаемости", "EC-01", "Идеи тест-кейсов", "`[CRITICAL]`"):
-        assert section in md
-    assert "РАЗРАБОТКУ НАЧИНАТЬ НЕ РЕКОМЕНДУЕТСЯ" in md
+    from reqreview.present import render_markdown
+    from reqreview.records import finalize
+    data = finalize(json.loads(to_json(res, "test")), doc)
+    md = render_markdown(data, doc)
+    for section in ("1. Паспорт прогона", "2. Нарезка и инвентаризация требований",
+                    "3. Детальная проверка каждого требования", "4. Проверка набора требований в целом",
+                    "5. Сводная статистика", "6. Итоговый вердикт", "Матрица прослеживаемости", "EC-01",
+                    "Идеи тест-кейсов", "CRITICAL"):
+        assert section in md, section
+    assert "не готов к разработке" in md
     assert res.requirements[0].id == "REQ-01"
     assert "строка" in md
 
