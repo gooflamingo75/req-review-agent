@@ -151,6 +151,21 @@ def _same_root(a, b) -> bool:
     return sim >= 0.75
 
 
+def _same_in_requirement(a, b, req_text: str) -> bool:
+    """Два замечания к одному требованию описывают одну проблему: близкий текст, либо один и тот же
+    процитированный фрагмент (не всё требование целиком) и хоть какая-то смысловая близость."""
+    sim = similarity(a.problem + " " + a.recommendation, b.problem + " " + b.recommendation)
+    if sim >= 0.45 or (a.criterion == b.criterion and sim >= 0.35):
+        return True
+    qa, qb = (a.quote or "").strip("«» "), (b.quote or "").strip("«» ")
+    whole = (req_text or "").strip()
+    if a.verified and b.verified and qa and qb and qa != whole and qb != whole:
+        short_, long_ = sorted((qa.lower(), qb.lower()), key=len)
+        if len(short_) >= 8 and short_ in long_ and sim >= 0.15:
+            return True
+    return False
+
+
 def consolidate(reqs, set_findings, finding_cls, section_of=None):
     """Возвращает (новый список замечаний к набору, статистика объединения).
     section_of(gid) — раздел документа для строки (чтобы не склеивать дефекты из разных разделов)."""
@@ -221,17 +236,22 @@ def consolidate(reqs, set_findings, finding_cls, section_of=None):
                 keep.append(f)
         r.findings = keep
 
-    # 3) дубли внутри одного требования
+    # 3) одна первопричина внутри требования = один дефект с несколькими критериями (R01/R02)
     for r in reqs:
         uniq: list = []
-        for f in r.findings:
-            dup = next((u for u in uniq if u.criterion == f.criterion and similarity(u.problem, f.problem) >= 0.6), None)
+        for f in sorted(r.findings, key=lambda x: (SEVERITY_ORDER[x.severity], not x.recommendation)):
+            dup = next((u for u in uniq if _same_in_requirement(u, f, r.text)), None)
             if dup is None:
                 uniq.append(f)
             else:
-                dup.merged = getattr(dup, "merged", 0) + 1
-                if SEVERITY_ORDER[f.severity] < SEVERITY_ORDER[dup.severity]:
-                    dup.severity = f.severity
+                dup.merged = getattr(dup, "merged", 0) + 1 + getattr(f, "merged", 0)
+                dup.criteria = list(dict.fromkeys((getattr(dup, "criteria", None) or [dup.criterion])
+                                                  + (getattr(f, "criteria", None) or [f.criterion])))
+                dup.obs = list(dict.fromkeys((getattr(dup, "obs", None) or []) + (getattr(f, "obs", None) or [])))
+                if not dup.recommendation and f.recommendation:
+                    dup.recommendation = f.recommendation
+                if similarity(f.problem, dup.problem) < 0.5 and f.problem not in dup.also:
+                    dup.also.append(f.problem)
         r.findings = uniq
 
     for m in merged:

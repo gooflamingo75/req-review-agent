@@ -480,7 +480,7 @@ def _headline(v: View) -> tuple[str, str]:
     if v.status == "na":
         return "В документе нет оцениваемых требований — оценка качества не выставляется.", "na"
     if nc:
-        ng = len(v.root_groups(crit))
+        ng = len(_decisions(v)) or nc
         return (f"Документ не готов к разработке{partial}: {nc} {plural(nc, 'блокер', 'блокера', 'блокеров')} "
                 + (f"сводятся к {ng} {plural(ng, 'решению', 'решениям', 'решениям')} " if ng < nc else "")
                 + f"({', '.join(themes[:3])}) — их нужно принять до старта спринта.", "fail")
@@ -493,75 +493,15 @@ def _headline(v: View) -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------- стр. 1: решения
-OWNER_BY_TAG = {"CONTRADICTION": "Владелец продукта", "PRIORITY": "Владелец продукта",
-                "REST-METHOD": "Владелец API", "STATUS-200": "Владелец API", "STATUS-CODE": "Владелец API",
-                "FORMAT": "Владелец API", "DATA-TYPE": "Владелец API", "SECURITY": "Владелец API",
-                "IDEMPOTENCY": "Владелец API", "ERROR-HANDLING": "Аналитик", "UNITS": "Аналитик",
-                "ACCEPTANCE": "QA-лид", "EDGE-CASE": "Аналитик"}
-API_TAGS = {"REST-METHOD", "STATUS-200", "STATUS-CODE", "FORMAT", "DATA-TYPE", "SECURITY", "IDEMPOTENCY"}
-ROLES = [("analyst", "Аналитик", "формулировки, пропуски, бизнес-правила, оформление документа"),
-         ("api", "Владелец API", "контракт API: методы, коды ответов, типы и форматы данных"),
-         ("qa", "QA", "критерии приёмки, тестовые разделы и проверяемость")]
-# Норма ручной инспекции документа: ≈1 страница в час (Gilb & Graham, «Software Inspection», 1993);
-# страница — 1 800 знаков (учётный стандарт).
-INSPECTION_PAGES_PER_HOUR = 1.0
-CHARS_PER_PAGE = 1800
+INSPECTION_PAGES_PER_HOUR = 1.0      # норма ручной инспекции: ≈1 стр. в час (Gilb & Graham, «Software Inspection»)
+CHARS_PER_PAGE = 1800                # учётная страница — 1 800 знаков
 
 
-def _sentence(t: str) -> str:
-    """Первое предложение целиком (без обрезки по символам)."""
-    t = collapse_ws(t)
-    m = re.search(r"(?<=[^\d\s][.!?])\s+(?=[А-ЯA-Z«])", t)
-    return t[:m.start()] if m else t
-
-
-def _options(text: str) -> list[str]:
-    """Варианты решения из формулировки «указать: A или B» / «X ли A или B» (для отчётов без поля options)."""
-    t = collapse_ws(text or "")
-    m = re.search(r"\bуказать:\s*([^():;]+?)\s+или\s+([^().;]+)", t, re.I)
-    if m:
-        a, b = m.group(1).strip(" ,«»"), m.group(2).strip(" ,«»")
-    else:
-        m = re.search(r"\b(\w+)\s+ли\s+(.+?)\s+или\s+(.+?)(?:[.;)]|$)", t, re.I)
-        if not m:
-            return []
-        a, b = m.group(2).strip(" ,"), m.group(3).strip(" ,")
-    if not (2 <= len(a) <= 120 and 2 <= len(b) <= 120):
-        return []
-    return [a[:1].upper() + a[1:], b[:1].upper() + b[1:]]
-
-
-def _role(v: View, f: dict) -> str:
-    tag = f.get("tag") or ""
-    kinds = {(v.req_by.get(r) or {}).get("kind", "").lower() for r in (f.get("requirements") or [f.get("_req")]) if r}
-    text = (f.get("problem") or "").lower()
-    if tag == "ACCEPTANCE" or (tag == "SECTION-EMPTY" and "тест" in text) or \
-            any("приём" in k or "прием" in k for k in kinds) or f.get("criterion") == "VER" and "тест" in text:
-        return "qa"
-    if tag in API_TAGS or any("api" in k or "интерфейс" in k for k in kinds):
-        return "api"
-    return "analyst"
-
-
-def decisions(v: View) -> list[dict]:
-    """Блокеры, сведённые к решениям: вопрос, варианты, влияние на бизнес, кто решает."""
-    out = []
-    for grp in v.root_groups(v.by_sev("CRITICAL")):
-        f = grp[0]
-        why = next((g.get("why_critical") for g in grp if (g.get("why_critical") or {}).get("decision")), None) \
-            or f.get("why_critical") or {}
-        rec = why.get("resolution") or f.get("recommendation") or ""
-        opts = why.get("options") or _options(rec) or _options(f.get("recommendation") or "")
-        if len(opts) < 2:
-            opts = [f"{_sentence(rec).rstrip('.')} (рекомендуется)" if rec else "Исправить документ (рекомендуется)",
-                    "Отложить: зафиксировать допущение и риск в документе"]
-        owner = why.get("owner") or OWNER_BY_TAG.get(f.get("tag") or "") or \
-            {"api": "Владелец API", "qa": "QA-лид"}.get(_role(v, f), "Аналитик")
-        out.append({"question": why.get("decision") or _sentence(v.clean(f["problem"])),
-                    "options": [v.clean(x) for x in opts],
-                    "impact": why.get("impact") or why.get("business") or _sentence(v.clean(f["problem"])),
-                    "owner": owner, "ids": [g["id"] for g in grp], "where": where_short(f)})
-    return out
+def _decisions(v: View) -> list[dict]:
+    if v.d.get("decisions") is None:
+        from .records import finalize
+        finalize(v.d)
+    return v.d.get("decisions") or []
 
 
 def _value_line(v: View) -> str | None:
@@ -620,19 +560,23 @@ def _page_decisions(v: View, o: Out):
                     f"проверено **{pct:.0f}%** текста" if pct is not None else "",
                     f"статус проверки: **{st_label}** ([подробнее](#scope-detail))"]).replace(" ·  · ", " · "))
     _comparison_block(v, o, full=False)
+    vd = v.d.get("validation") or {}
+    if vd.get("status") == "failed":
+        o.callout("Отчёт не прошёл часть проверок согласованности (" + ", ".join(vd.get("failed") or []) +
+                  ") — выводы предварительные, см. [журнал проверки](#app-b).", "warn")
     val = _value_line(v)
     if val:
         o.p(val, "note")
-    ds = decisions(v)
+    ds = _decisions(v)
     if ds:
         o.h(2, f"{len(ds)} {plural(len(ds), 'решение', 'решения', 'решений')} до старта разработки", "decisions")
         rows = []
-        for n, d in enumerate(ds, 1):
+        for d in ds:
             opts = "\n".join(f"{chr(0x410 + i)}) {x}" for i, x in enumerate(d["options"]))
-            rows.append([str(n), f"**{d['question']}**\n{opts}", d["impact"], d["owner"],
-                         ", ".join(v.flink(x) for x in d["ids"])])
+            rows.append([d["id"], f"**{d['question']}**\n{opts}", d["impact"], d["owner"],
+                         ", ".join(v.flink(x) for x in d["findings"])])
         o.table(["#", "Что решить и варианты", "Влияние на бизнес", "Кто решает", "Дефекты"], rows,
-                [3, 52, 25, 11, 9], "dec")
+                [5, 51, 24, 11, 9], "dec")
     else:
         o.h(2, "Решений, блокирующих разработку, нет", "decisions")
     o.p("Далее: [план исправлений по ролям](#fixes) · [вопросы и тест-кейсы](#qa) · "
@@ -642,105 +586,65 @@ def _page_decisions(v: View, o: Out):
 
 # ---------------------------------------------------------------- стр. 2–3: план исправлений
 def _fixlist(v: View, o: Out):
+    from .records import ROLES
+    plan = v.d.get("plan") or []
     o.h(2, "План исправлений по ролям", "fixes")
-    in_dec = {x for d in decisions(v) for x in d["ids"]}
-    rest = [f for f in v.all_f if f["id"] not in in_dec]
-    by_role: dict[str, list] = {k: [] for k, _, _ in ROLES}
-    for f in rest:
-        by_role[_role(v, f)].append(f)
-    total = 0
-    plan = []
+    rows_total = 0
+    by_role: dict[str, dict] = {k: {} for k, _, _ in ROLES}
+    for a in plan:                      # строки — по требованию (для чтения), действия — каждое отдельно
+        key = a["requirements"][0] if len(a["requirements"]) == 1 else "набор:" + a["finding"]
+        by_role[a["role"]].setdefault(key, []).append(a)
+    rows_total = sum(len(x) for x in by_role.values())
+    o.p(f"Блокеры — на первой странице. Здесь — {len(plan)} "
+        f"{plural(len(plan), 'действие', 'действия', 'действий')} по остальным дефектам, по одному на дефект "
+        f"(сгруппированы в {rows_total} {plural(rows_total, 'строку', 'строки', 'строк')} по требованиям). "
+        "Действие с пометкой «После решения D-…» выполняется после решения с первой страницы.")
     for key, name, scope in ROLES:
-        fs = by_role[key]
-        groups = _merge_by_requirement(v, v.root_groups([f for f in fs if f["severity"] != "MINOR"]))
-        minors = [f for f in fs if f["severity"] == "MINOR"]
-        plan.append((key, name, scope, groups, minors))
-        total += len(groups) + (1 if minors else 0)
-    o.p(f"Блокеры — на первой странице. Здесь — остальные {len(rest)} "
-        f"{plural(len(rest), 'дефект', 'дефекта', 'дефектов')}, сведённые к {total} "
-        f"{plural(total, 'действию', 'действиям', 'действиям')} без повторов: дефекты с общей первопричиной "
-        "закрываются одним действием.")
-    for key, name, scope, groups, minors in plan:
-        if not groups and not minors:
+        groups = by_role[key]
+        if not groups:
             continue
         o.h(3, f"{name} — {scope}", f"fix-{key}")
         rows = []
-        for grp in groups:
-            f = grp[0]
-            reqs = list(dict.fromkeys(x for g in grp for x in (g.get("requirements") or ([g["_req"]] if g.get("_req") else []))))
-            recs = list(dict.fromkeys(v.clean(g["recommendation"]) for g in grp if g.get("recommendation")))
-            action = " ".join(recs[:2]) if recs else "Устранить: " + v.clean(f["problem"])
-            rows.append([str(len(rows) + 1), sev_tag(f["severity"]), action,
-                         ", ".join(v.flink(g["id"]) for g in grp), v.refs(reqs, 3)])
-        if minors:
-            reqs = list(dict.fromkeys(x for g in minors for x in (g.get("requirements") or ([g["_req"]] if g.get("_req") else []))))
-            rows.append([str(len(rows) + 1), sev_tag("MINOR"),
-                         f"Мелкие правки ({len(minors)}) — в рабочем порядке; формулировки и рекомендации — "
-                         "по ссылкам на дефекты.", ", ".join(v.flink(g["id"]) for g in minors), v.refs(reqs, 3)])
+        for k, acts in sorted(groups.items(), key=lambda kv: (min(SEV_ORDER[a["severity"]] for a in kv[1]),
+                                                              kv[0])):
+            worst = min((a["severity"] for a in acts), key=lambda x: SEV_ORDER[x])
+            text = "\n".join(f"• {a['text']} ({v.flink(a['finding'])})" for a in acts) if len(acts) > 1 else \
+                acts[0]["text"]
+            where = v.refs(acts[0]["requirements"], 3) if not k.startswith("набор:") else \
+                v.refs(acts[0]["requirements"], 3)
+            rows.append([str(len(rows) + 1), sev_tag(worst), text,
+                         ", ".join(v.flink(a["finding"]) for a in acts), where])
         o.table(["#", "Приоритет", "Что сделать", "Дефекты", "Требования"], rows, [4, 11, 55, 14, 16])
-
-
-def _merge_by_requirement(v: View, groups: list[list[dict]]) -> list[list[dict]]:
-    """Дефекты одного требования без собственной рекомендации (выведены из комментария к критерию) или с близким
-    смыслом — одно действие, а не несколько строк плана."""
-    from .consolidate import similarity
-
-    def reqs(grp):
-        return {x for g in grp for x in (g.get("requirements") or ([g["_req"]] if g.get("_req") else []))}
-    out: list[list[dict]] = []
-    for grp in groups:
-        host = None
-        if len(reqs(grp)) == 1:
-            for o_ in out:
-                if reqs(o_) == reqs(grp):
-                    has_rec = any(g.get("recommendation") for g in grp)
-                    sim = similarity(" ".join(g["problem"] for g in grp), " ".join(g["problem"] for g in o_))
-                    if not has_rec or sim >= 0.2:
-                        host = o_
-                        break
-        if host is None:
-            out.append(list(grp))
-        else:
-            host.extend(grp)
-    for grp in out:
-        grp.sort(key=lambda f: (SEV_ORDER[f["severity"]], not f.get("recommendation"), f["id"]))
-    return out
+    recs = v.d.get("recommendations") or []
+    if recs:
+        o.h(3, "Рекомендации (не дефекты, по желанию)", "fix-recs")
+        o.table(["#", "Рекомендация", "Где"], [[str(i), v.clean(r_["text"]), r_.get("where") or "—"]
+                                              for i, r_ in enumerate(recs, 1)], [5, 75, 20])
 
 
 # ---------------------------------------------------------------- стр. 4: вопросы и тест-кейсы
 def _questions_tests(v: View, o: Out):
-    from .consolidate import similarity
     o.h(2, "Вопросы к аналитику и тест-кейсы", "qa")
-    qs = [(r["id"], q) for r in v.reqs for q in r.get("questions") or []] + \
-         [(f"EC-{i:02d}", e["question"]) for i, e in enumerate(v.d.get("edge_cases") or [], 1) if e.get("question")]
-    uniq: list[tuple[list, str]] = []           # один вопрос — одна строка, со всеми источниками
-    for a, q in qs:
-        host = next((u for u in uniq if similarity(u[1], q) >= 0.6), None)
-        if host is None:
-            uniq.append(([a], q))
-        elif a not in host[0]:
-            host[0].append(a)
+    qs = v.d.get("questions") or []
     o.h(3, "Вопросы к аналитику", "questions")
-    if uniq:
-        o.table(["#", "Вопрос", "Откуда"], [[f"Q-{n:02d}", q, ", ".join(v.ref(a) if a in v.req_by else
-                                                                         f"[{a}](#edge)" for a in src)]
-                                           for n, (src, q) in enumerate(uniq, 1)], [7, 73, 20])
+    if qs:
+        o.table(["#", "Вопрос", "Откуда"],
+                [[q["id"], q["text"] + (f" (решение {', '.join(q['decisions'])})" if q.get("decisions") else ""),
+                  ", ".join(v.ref(a) if a in v.req_by else f"[{a}](#edge)" for a in q["sources"])] for q in qs],
+                [7, 73, 20])
     else:
         o.p("Открытых вопросов нет.")
-    tests: list[tuple[list, str]] = []
-    for r in v.reqs:
-        for t in r.get("test_ideas") or []:
-            host = next((u for u in tests if similarity(u[1], t) >= 0.7), None)
-            if host is None:
-                tests.append(([r["id"]], t))
-            elif r["id"] not in host[0]:
-                host[0].append(r["id"])
+    tests = v.d.get("tests") or []
     o.h(3, "Тест-кейсы (идеи для QA)", "tests")
     if tests:
         o.table(["#", "Что проверить (исходные данные → ожидаемый результат)", "Требование"],
-                [[f"TC-{n:02d}", v.clean(t), v.refs(src, 3)] for n, (src, t) in enumerate(tests, 1)], [7, 73, 20])
-        o.note("Тест-кейсы с пометкой «противоречит …» проверяют правило, которое конфликтует с другим, — "
-               "их ожидаемый результат зависит от решения на первой странице.")
+                [[t["id"], v.clean(t["text"]) + (f"\n⚠ Условный: ожидаемый результат зависит от решения "
+                                                 f"{', '.join(t['depends_on'])}" if t.get("conditional") else ""),
+                  v.refs(t["requirements"], 3)] for t in tests], [7, 73, 20])
+        n_cond = sum(1 for t in tests if t.get("conditional"))
+        if n_cond:
+            o.note(f"{n_cond} {plural(n_cond, 'тест-кейс зависит', 'тест-кейса зависят', 'тест-кейсов зависят')} от "
+                   "открытых решений с первой страницы: до решения ожидаемый результат — условный.")
     else:
         o.p("Идей тест-кейсов не сформировано.")
 
@@ -1033,6 +937,13 @@ def _appendices(v: View, o: Out):
     _comparison_block(v, o, full=True)
     o.h(2, "Приложение З. Журнал проверки", "app-b")
     o.bullets(list(dict.fromkeys(v.d.get("warnings") or [])) or ["Предупреждений нет."])
+    vd = v.d.get("validation") or {}
+    if vd.get("checks"):
+        o.h(3, "Проверки согласованности отчёта перед выводом", "validation")
+        o.table(["Код", "Проверка", "Итог", "Замечания"],
+                [[c["id"], c["title"], "{ok}пройдена" if c["ok"] else "{fail}не пройдена",
+                  ", ".join(c["problems"]) or "—"] for c in vd["checks"]], [8, 52, 14, 26])
+        o.note(vd.get("semantic", ""))
     dropped = v.d.get("dropped") or []
     if dropped:
         o.table(["Где", "Отклонённый кандидат", "Почему", "Доказательство"],

@@ -49,6 +49,9 @@ class Finding:
     also: list[str] = field(default_factory=list)   # другие формулировки той же первопричины
     why: dict = field(default_factory=dict)          # «Почему это критично» (для CRITICAL)
     caveat: str = ""                                 # оговорка (например, доказательство распознано OCR)
+    criteria: list[str] = field(default_factory=list)   # все затронутые критерии одной первопричины
+    kind: str = "defect"                             # defect | clarification | recommendation
+    obs: list[str] = field(default_factory=list)     # исходные наблюдения (проходы), слитые в этот дефект
 
     def __eq__(self, other):                # сравнение по идентичности объекта (для списков и remove)
         return self is other
@@ -94,6 +97,7 @@ class Result:
     dropped: list[dict] = field(default_factory=list)
     checks: dict = field(default_factory=dict)
     coverage: dict = field(default_factory=dict)
+    recommendations: list = field(default_factory=list)
     status: str = "completed"
     status_reasons: list[str] = field(default_factory=list)
 
@@ -102,6 +106,15 @@ def _sev(s) -> str:
     s = str(s or "").lower().strip()
     s = _SEV_ALIASES.get(s, s)
     return s if s in SEVERITY else "major"
+
+
+def _kind(s) -> str:
+    t = str(s or "").lower().strip()
+    if t.startswith(("clar", "вопрос", "уточн")):
+        return "clarification"
+    if t.startswith(("recom", "рекоменд", "suggest", "предлож")):
+        return "recommendation"
+    return "defect"
 
 
 def _tag(s) -> str:
@@ -302,10 +315,13 @@ def review_requirements(doc: Document, reqs: list[Requirement], llm, batch_size:
                 if not problem:
                     continue
                 q, g1, g2, ok = _anchor(doc, str(f.get("quote") or ""), r)
+                crits = [x for x in (str(y).upper().strip() for y in (f.get("criteria") or [])) if x in INDIVIDUAL]
                 r.findings.append(Finding(criterion=c, severity=_sev(f.get("severity")), problem=problem,
                                           recommendation=collapse_ws(str(f.get("recommendation") or "")),
                                           quote=q, g1=g1, g2=g2, verified=ok, req_ids=[r.id], tag=_tag(f.get("tag")),
-                                          source="правило" if is_mock else "LLM"))
+                                          source="правило" if is_mock else "LLM",
+                                          criteria=list(dict.fromkeys([c] + crits)), kind=_kind(f.get("classification")),
+                                          obs=[f"review:{r.id}"]))
 
         for rc, r in zip(recs, batch):
             if rc.status == "sent":
@@ -332,7 +348,10 @@ def review_requirements(doc: Document, reqs: list[Requirement], llm, batch_size:
                                           req_ids=[r.id], source="правило",
                                           tag=h.get("tag") or RULE_TAGS.get(h["criterion"], "")))
         for f in r.findings:
-            _bump(r, f.criterion, "warn" if f.severity == "minor" else "fail")
+            if f.kind != "defect":
+                continue
+            for c in (f.criteria or [f.criterion]):
+                _bump(r, c, "warn" if f.severity == "minor" else "fail")
         r.findings.sort(key=lambda f: (SEVERITY_ORDER[f.severity], list(INDIVIDUAL).index(f.criterion)))
 
 
@@ -365,7 +384,8 @@ def _set_findings_from(data: dict, doc: Document, by_id: dict, counters: dict) -
                      recommendation=collapse_ws(str(f.get("recommendation") or "")),
                      quotes=quotes, quote=" … ".join(f"«{q}»" for q in quotes), req_ids=ids,
                      type=collapse_ws(str(f.get("type") or "Прочее")), tag=_tag(f.get("tag")),
-                     verified=bool(quotes), locs=locs)
+                     verified=bool(quotes), locs=locs, kind=_kind(f.get("classification")), criteria=[c],
+                     obs=["set"])
         if locs:
             fd.g1, fd.g2 = locs[0]
         out.append(fd)
@@ -660,6 +680,8 @@ def run(doc: Document, llm, batch_size: int = 8) -> Result:
     acc = verify.acceptance_gaps(reqs, trace, Finding)
     if acc is not None:
         set_findings.append(acc)
+    recs: list[dict] = []
+    _split_kinds(reqs, set_findings, edge_cases, recs)
     log("[4/5] Объединение дефектов по первопричине…")
     set_findings, cstats = consolidate(reqs, set_findings, Finding, section_of=doc.section_of)
     if cstats["merged"]:
@@ -674,7 +696,14 @@ def run(doc: Document, llm, batch_size: int = 8) -> Result:
     doc_text = doc.numbered() if doc.char_count() <= SET_FULL_DOC_CHARS else doc.headings_outline()
     dropped = verify.critic(doc, reqs, set_findings, llm, doc_text, prompts, warnings, cov,
                              edge_cases=edge_cases)
+    _split_kinds(reqs, set_findings, edge_cases, recs)
     checks["sanitized"] = verify.sanitize(doc, [f for r in reqs for f in r.findings] + set_findings)
+    _number(reqs, set_findings)                       # временные номера для обоснования критичности
+    allf = [f for r in reqs for f in r.findings] + set_findings
+    checks["severity_rubric"] = verify.severity_rubric(allf)
+    checks["ocr_guard"] = verify.ocr_guard(doc, allf)
+    verify.explain_critical(doc, reqs, set_findings, llm, doc_text, prompts, warnings, cov)
+    # окончательный порядок и номера — после всех изменений критичности; все ссылки пересчитываются от них
     for r in reqs:
         r.findings.sort(key=lambda f: (SEVERITY_ORDER[f.severity], list(INDIVIDUAL).index(f.criterion)))
     set_findings.sort(key=lambda f: (SEVERITY_ORDER[f.severity], -len(f.locs)))
@@ -683,8 +712,6 @@ def run(doc: Document, llm, batch_size: int = 8) -> Result:
     verify.restamp_dropped(dropped)
     checks["post"] = verify.self_check(doc, reqs, set_findings, Finding, final=True)
     checks["marks_aligned"] = verify.align_marks(reqs, edge_cases)
-    checks["ocr_guard"] = verify.ocr_guard(doc, [f for r in reqs for f in r.findings] + set_findings)
-    verify.explain_critical(doc, reqs, set_findings, llm, doc_text, prompts, warnings, cov)
     verify.fill_quotes(doc, set_findings)
     refs = verify.fix_references(doc, reqs, set_findings, edge_cases)
     checks["references"] = refs
@@ -721,7 +748,8 @@ def run(doc: Document, llm, batch_size: int = 8) -> Result:
         "req_findings": sum(len(r.findings) for r in reqs),
         "set_findings": len(set_findings),
         "by_severity": {s: sum(1 for f in all_f if f.severity == s) for s in SEVERITY},
-        "by_criterion": {c: sum(1 for r in reqs for f in r.findings if f.criterion == c) for c in INDIVIDUAL},
+        "by_criterion": {c: sum(1 for r in reqs for f in r.findings if c in (f.criteria or [f.criterion]))
+                         for c in INDIVIDUAL},
         "by_part": by_part,
         "occurrences": sum(len(r.findings) for r in reqs) + sum(max(1, len(f.locs)) for f in set_findings),
         "merged": cstats["merged"],
@@ -744,7 +772,38 @@ def run(doc: Document, llm, batch_size: int = 8) -> Result:
     return Result(doc=doc, model_name=llm.name, requirements=reqs, set_findings=set_findings,
                   set_criteria=set_criteria, edge_cases=edge_cases, traceability=trace, stats=stats,
                   warnings=warnings, started=started, finished=time.time(), llm_calls=llm.calls,
-                  dropped=dropped, checks=checks, coverage=csum, status=status, status_reasons=reasons)
+                  dropped=dropped, checks=checks, coverage=csum, status=status, status_reasons=reasons,
+                  recommendations=recs)
+
+
+def _split_kinds(reqs, set_findings, edge_cases, recs) -> None:
+    """Вопросы (clarification) и необязательные улучшения (recommendation) — не дефекты: они уходят в вопросы к
+    аналитику и в список рекомендаций и не попадают в счётчики дефектов."""
+    def q_of(f):
+        t = f.problem.strip()
+        return t if t.endswith("?") else (f.recommendation.strip() if f.recommendation.strip().endswith("?") else t)
+    for r in reqs:
+        keep = []
+        for f in r.findings:
+            if f.kind == "clarification":
+                if all(similarity(q_of(f), q) < 0.6 for q in r.questions):
+                    r.questions.append(q_of(f))
+            elif f.kind == "recommendation":
+                recs.append({"where": r.id, "req_ids": [r.id], "problem": f.problem,
+                             "text": f.recommendation or f.problem})
+            else:
+                keep.append(f)
+        r.findings = keep
+    keep = []
+    for f in set_findings:
+        if f.kind == "clarification":
+            edge_cases.append({"scenario": f.problem, "req_ids": f.req_ids[:6], "risk": "", "question": q_of(f)})
+        elif f.kind == "recommendation":
+            recs.append({"where": ", ".join(f.req_ids[:4]) or "набор", "req_ids": f.req_ids[:6], "problem": f.problem,
+                         "text": f.recommendation or f.problem})
+        else:
+            keep.append(f)
+    set_findings[:] = keep
 
 
 def _number(reqs, set_findings):

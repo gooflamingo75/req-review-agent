@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import json
 import re
 from difflib import SequenceMatcher
 
@@ -34,6 +35,8 @@ WORD_RULES = [
     (r"\bгибк\w*", ["UNA", "VER"], "«гибкий» — не определено, какие изменения должны поддерживаться", "minor"),
     (r"\bсвоевременн\w*", ["UNA", "VER"], "«своевременно» — не указан срок", "major"),
     (r"\bоперативн\w*", ["UNA", "VER"], "«оперативно» — не указан срок/время реакции", "major"),
+    (r"\bв\s+кратчайш\w+\s+срок\w*|\bкак\s+можно\s+(быстрее|скорее)", ["UNA", "VER"],
+     "срок не задан числом — «в кратчайшие сроки» нельзя проверить", "major"),
     (r"\bмгновенн\w*", ["FEA", "VER"], "«мгновенно» — недостижимо буквально; нужно допустимое время", "major"),
     (r"\bкачественн\w*", ["UNA", "VER"], "«качественно» — не указан критерий качества", "minor"),
     (r"\bкорректн\w*", ["UNA"], "«корректно» — не определено, что считается корректным поведением", "minor"),
@@ -93,6 +96,7 @@ _compiled = [(re.compile(p, _I), c, e, s) for p, c, e, s in WORD_RULES]
 TIME_RE = re.compile(
     r"\b(в\s+течение|не\s+более|не\s+дольше|до|за|within|in\s+under|under)\s+"
     r"(\d+[\s,.]?\d*\s*)?(мс|миллисекунд\w*|сек\w*|с\b|минут\w*|мин\b|час\w*|ms|millisec\w*|sec\w*|minutes?|hours?)", _I)
+START_RE = re.compile(r"(после|с\s+момента|от\s+момента|после\s+получения|after|from)\s+[\w«»\-]+(\s+[\w«»\-]+)?", _I)
 PERCENTILE_RE = re.compile(r"перцентил\w*|процентил\w*|\bp\d{2}\b|\d{2}(?:[.,]\d+)?\s*%|percentile|"
                            r"в\s+\d+\s+из\s+\d+|при\s+нагрузке|под\s+нагрузкой|\bRPS\b|\bTPS\b", _I)
 
@@ -147,13 +151,17 @@ def check_requirement(text: str) -> list[dict]:
     for m in TIME_RE.finditer(text):
         if PERCENTILE_RE.search(text):
             break
+        start = START_RE.search(text)
+        missing = "доли событий (перцентиля) и условий нагрузки" + ("" if start else ", а также точки начала отсчёта")
         hits.append({
             "criterion": "VER", "criteria": ["VER", "UNA"], "severity": "major", "trigger": m.group(0), "tag": "NFR-METRIC",
             "quote": _context(text, m.start(), m.end()),
-            "problem": f"Ограничение по времени «{m.group(0)}» задано без доли запросов (перцентиля), "
-                       "условий нагрузки и точек начала/окончания измерения — непонятно, что именно и как измерять.",
-            "recommendation": "Указать перцентиль (например, 95% событий), нагрузку, точку начала и окончания "
-                              "отсчёта (что считается завершением — передача, доставка, получение) и способ замера.",
+            "problem": f"Ограничение по времени «{m.group(0)}» задано без {missing}"
+                       + (f"; точка начала указана («{start.group(0)}»)" if start else "")
+                       + " — неясно, при каком результате замера требование выполнено.",
+            "recommendation": "Указать согласованную долю событий (перцентиль), условия нагрузки и способ замера"
+                              + ("" if start else ", а также момент начала отсчёта") +
+                              "; значения — решение владельца продукта (не выдумывать).",
         })
         break
     modals = MODAL_RE.findall(text)
@@ -284,6 +292,76 @@ def _param_rows(lines) -> list[tuple[str, str, object]]:
     return out
 
 
+_RESP_HEAD = re.compile(r"ответ|response|статус|status|\b[2-5]\d\d\b", re.I)
+_REQ_HEAD = re.compile(r"запрос|request|query|path|body|параметр|parameters", re.I)
+
+
+def _direction_of(text: str) -> str | None:
+    t = text.lstrip("#").strip()
+    if _RESP_HEAD.search(t):
+        return "resp"
+    if _REQ_HEAD.search(t):
+        return "req"
+    return None
+
+
+def _schema_kind(fmt: str) -> str | None:
+    f = fmt.lower()
+    if re.search(r"\b(int|integer|long|number|numeric|decimal|float|double|число|целое)\b", f):
+        return "number"
+    if re.search(r"\b(string|str|text|строка)\b", f):
+        return "string"
+    if re.search(r"\b(bool|boolean|логическ\w*)\b", f):
+        return "boolean"
+    return None
+
+
+def _json_kind(v) -> str | None:
+    if isinstance(v, bool):
+        return "boolean"
+    if isinstance(v, (int, float)):
+        return "number"
+    if isinstance(v, str):
+        return "string"
+    return None
+
+
+def _schema_vs_examples(lines):
+    """По направлениям (запрос / ответ): поля таблиц-схем и JSON-примеры, найденные под заголовками этого
+    направления. Направление задаёт ближайший заголовок («Ответ», «Статусы», «200 …» — ответ; «Запрос»,
+    «Query-параметры», «Request body» — запрос)."""
+    direction, level = None, 0
+    tagged = []
+    for ln in lines:
+        if ln.is_heading:
+            lvl = len(ln.text) - len(ln.text.lstrip("#")) or 3
+            d = _direction_of(ln.text)
+            if d:
+                direction, level = d, lvl
+            elif lvl <= level:
+                direction = None
+        tagged.append((ln, direction))
+    out = []
+    for d in ("req", "resp"):
+        sub = [ln for ln, x in tagged if x == d]
+        rows = {}
+        for name, fmt, ln in _param_rows(sub):
+            rows.setdefault(name.strip("`"), (fmt, ln))
+        examples = []
+        for ln in sub:
+            t = ln.text.strip()
+            if t.startswith("{") and t.endswith("}"):
+                try:
+                    obj = json.loads(t)
+                except ValueError:
+                    continue
+                if isinstance(obj, dict):
+                    examples.append((ln, obj))
+        if rows and examples:
+            out.append((d, rows, examples))
+    return out
+
+
 def check_document(doc) -> list[dict]:
     """Детерминированные проверки по всему тексту документа (единицы измерения, HTTP-семантика,
     заглушки шаблона). Возвращает замечания к набору с дословными цитатами и строками."""
@@ -411,28 +489,32 @@ def check_document(doc) -> list[dict]:
         })
         del ln0
 
-    # 4в. Одно и то же поле в разных таблицах параметров с разным типом/форматом
-    seen_fmt: dict[str, list] = {}
-    for name, fmt, ln in _param_rows(lines):
-        seen_fmt.setdefault(name, []).append((fmt, ln))
-    bad = []
-    for name, rows in seen_fmt.items():
-        if len({f for f, _ in rows}) >= 2:
-            bad.append((name, rows[0], next(r for r in rows if r[0] != rows[0][0])))
-    if bad:
-        locs, parts = [], []
-        for name, (f1, l1), (f2, l2) in bad[:4]:
-            locs += [(l1.gid, collapse(l1.text)), (l2.gid, collapse(l2.text))]
-            parts.append(f"«{name}»: {f1} и {f2}")
-        out.append({
-            "type": "Несогласованность", "criterion": "S-CONS", "severity": "major", "tag": "DATA-TYPE",
-            "locs": locs,
-            "problem": "Одни и те же поля описаны с разными типами в разных таблицах параметров ("
-                       + "; ".join(parts) + "). Клиент и сервер могут по-разному сериализовать и проверять "
-                       "значения (например, число и строка).",
-            "recommendation": "Зафиксировать один тип и формат каждого поля для всех мест (запрос, ответ, хранение) "
-                              "или явно описать преобразование между ними.",
-        })
+    # 4в. Схема и пример ОДНОГО И ТОГО ЖЕ сообщения (запрос или ответ) дают полю разные типы.
+    # Разные типы в запросе и ответе сами по себе не противоречие: направления сравниваются только между собой.
+    for direction, rows, examples in _schema_vs_examples(lines):
+        bad = []
+        for name, (fmt, row) in rows.items():
+            for ex_ln, obj in examples:
+                if name in obj:
+                    got = _json_kind(obj[name])
+                    want = _schema_kind(fmt)
+                    if got and want and got != want:
+                        bad.append((name, fmt, row, ex_ln, obj[name]))
+                        break
+        if bad:
+            locs, parts = [], []
+            for name, fmt, row, ex_ln, val in bad[:4]:
+                locs += [(row.gid, collapse(row.text)), (ex_ln.gid, collapse(ex_ln.text))]
+                parts.append(f"«{name}»: в таблице {fmt}, в примере {json.dumps(val, ensure_ascii=False)}")
+            what = "ответа" if direction == "resp" else "запроса"
+            out.append({
+                "type": "Несогласованность", "criterion": "S-CONS", "severity": "major", "tag": "DATA-TYPE",
+                "locs": locs,
+                "problem": f"Схема {what} и пример того же {what} задают полю разный тип (" + "; ".join(parts) +
+                           "). Клиент, написанный по схеме, не разберёт ответ из примера (или наоборот).",
+                "recommendation": f"Привести схему и пример {what} к одному типу для каждого поля; какой тип верный — "
+                                  "решает владелец API.",
+            })
 
     # 5. Заголовок Content-Type при отсутствии тела
     ct = find(r"Content-Type[^a-z]*application/json")

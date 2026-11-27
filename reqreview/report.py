@@ -713,6 +713,7 @@ def to_json(res: Result, agent_version: str) -> str:
                 "quote_verified": f.verified, "problem": f.problem, "recommendation": f.recommendation,
                 "source": f.source, "places": max(1, len(f.locs)), "merged_duplicates": f.merged,
                 "why_critical": f.why or None, "caveat": f.caveat or None, "also": f.also,
+                "criteria": f.criteria or [f.criterion], "classification": f.kind, "observations": f.obs,
                 "lines": [list(x) for x in (f.locs or ([(f.g1, f.g2)] if f.g1 is not None else []))]}
     data = {
         "document": {"title": res.doc.title, "file": res.doc.path.name, "sha256": res.doc.sha256},
@@ -729,6 +730,7 @@ def to_json(res: Result, agent_version: str) -> str:
                          for r in res.requirements],
         "set_criteria": {c: {"status": v["status"], "comment": v["comment"]} for c, v in res.set_criteria.items()},
         "set_findings": [fd(f) for f in res.set_findings],
+        "recommendations": res.recommendations,
         "edge_cases": res.edge_cases,
         "traceability": res.traceability,
         "warnings": list(dict.fromkeys(res.warnings)),
@@ -789,6 +791,8 @@ def write(res: Result, out_path: str | Path, agent_version: str, input_display: 
 def write_data(data: dict, doc, out_path: str | Path, agent_version: str) -> dict:
     """Все три файла строятся из одной модели данных (data) — её же можно загрузить из report.json."""
     from . import present
+    from .records import finalize
+    finalize(data, doc)                 # решения, план, вопросы, тесты, статистика и проверки — из одних записей
     md_p, pdf_p, js_p = output_paths(out_path)
     md_p.parent.mkdir(parents=True, exist_ok=True)
     md_p.write_text(present.render_markdown(data, doc), encoding="utf-8")

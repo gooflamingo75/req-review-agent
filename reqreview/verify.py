@@ -27,6 +27,9 @@ _LINE_REF = re.compile(r"\[L(\d+)\]|\bстрок[аеиу]?\s+(\d+)", re.I)
 
 
 # ------------------------------------------------------------------ 1. критик
+_POSITIVE = re.compile(r"^(реализуем\w*|выполним\w*|соответству\w*|согласован\w*|корректн\w*|без нарушени\w*|"
+                       r"указан\w*|определен\w*|описан\w*|однозначн\w*|проверяем\w*|тестируем\w*|ок|ok)\b[^,;]*$|"
+                       r"\b(допустимые значения|обязательност\w*)\b[^.]*\b(указан|заданы|определен)", re.I)
 _FID = re.compile(r"\b(?:F-\d{3}|S-\d{2}|EC-\d{2}|Q-\d{2})\b")
 
 
@@ -158,6 +161,40 @@ def critic(doc, reqs, set_findings, llm, doc_text: str, prompts_mod, warnings: l
                 f._dropped = True
                 continue
             verdict = "rewrite" if rv.get("problem") else "keep"
+        if verdict == "reclassify":
+            k = str(rv.get("classification") or "").lower()
+            if k in ("clarification", "recommendation"):
+                f.kind = k
+                changed += 1
+            continue
+        if verdict == "split" and isinstance(rv.get("parts"), list):
+            parts = [p for p in rv["parts"] if isinstance(p, dict) and collapse_ws(str(p.get("problem") or ""))]
+            good = [p for p in parts if p.get("supported", True) not in (False, "false", "no", "нет")]
+            bad = [p for p in parts if p not in good]
+            for p in bad:                                  # неподтверждённая часть — в журнал отклонённых (R18)
+                dropped.append({"_old": f.fid, "_index": index, "where": (r.id if r else ", ".join(f.req_ids[:5])),
+                                "problem": collapse_ws(str(p["problem"])),
+                                "reason": collapse_ws(str(p.get("reason") or "часть составного дефекта не подтверждена")),
+                                "evidence": ""})
+            if good:
+                first, rest = good[0], good[1:]
+                f.problem = collapse_ws(str(first["problem"]))
+                if first.get("recommendation"):
+                    f.recommendation = collapse_ws(str(first["recommendation"]))
+                for p in rest:
+                    import copy
+                    g = copy.copy(f)
+                    g.problem = collapse_ws(str(p["problem"]))
+                    g.recommendation = collapse_ws(str(p.get("recommendation") or ""))
+                    c = str(p.get("criterion") or "").upper()
+                    if (r is not None and c in INDIVIDUAL) or (r is None and c in SET):
+                        g.criterion, g.criteria = c, [c]
+                    g.locs, g.quotes, g.also, g.why = list(f.locs), list(f.quotes), [], {}
+                    (r.findings if r is not None else set_findings).append(g)
+                changed += 1
+            elif bad:
+                f._dropped = True
+            continue
         if verdict in ("rewrite", "severity"):
             sev = str(rv.get("severity") or "").lower()
             if sev in SEVERITY and sev != f.severity:
@@ -235,7 +272,7 @@ def self_check(doc, reqs, set_findings, finding_cls, final: bool) -> dict:
                     f" — см. дефект {f.fid or 'у ' + r.id}."
 
     for r in reqs:
-        covered = {f.criterion for f in r.findings}
+        covered = {c for f in r.findings for c in (f.criteria or [f.criterion])}
         covered |= {SET_TO_IND.get(f.criterion) for f in r.linked}
         if getattr(r, "related", None):
             covered.add("CON")
@@ -248,6 +285,20 @@ def self_check(doc, reqs, set_findings, finding_cls, final: bool) -> dict:
                 if re.search(r"огласован|без нарушени|соответству", cm, re.I):
                     r.comments[c] = ""
                     fixes["comments"] += 1
+                continue
+            if not final and cm and _POSITIVE.search(cm):
+                r.criteria[c] = "ok"                 # «реализуемо», «указано» — это не нарушение (R13)
+                fixes["comments"] += 1
+                continue
+            host = None
+            if not final and cm and r.findings:
+                from .consolidate import similarity
+                host = max(r.findings, key=lambda f: similarity(cm, f.problem + " " + f.recommendation))
+                if similarity(cm, host.problem + " " + host.recommendation) < 0.25:
+                    host = None
+            if host is not None:                     # тот же дефект, ещё один затронутый критерий (R01/R02)
+                host.criteria = list(dict.fromkeys((host.criteria or [host.criterion]) + [c]))
+                fixes["linked"] += 1
                 continue
             if not final and cm and not re.search(r"огласован|без нарушени", cm, re.I):
                 r.findings.append(finding_cls(
@@ -480,4 +531,21 @@ def fill_quotes(doc, set_findings) -> int:
                 f.quotes[i] = collapse_ws(txt)
                 n += 1
         f.quote = " … ".join(f"«{q}»" for q in f.quotes if q)
+    return n
+
+
+# ------------------------------------------------------------------ критичность по шкале
+FORM_TAGS = {"SECTION-EMPTY", "PLACEHOLDER", "APPROVALS", "VERSIONING", "STRUCTURE", "TRACEABILITY", "PRIORITY"}
+
+
+def severity_rubric(findings) -> int:
+    """Шкала руководства: пустые разделы — MAJOR, оформление — MINOR. CRITICAL для таких дефектов без отдельно
+    доказанного блокирующего эффекта не допускается (R12): понижаем и пишем почему."""
+    n = 0
+    for f in findings:
+        if f.severity == "critical" and f.tag in FORM_TAGS:
+            f.severity = "major"
+            f.caveat = ("Критичность приведена к MAJOR по шкале: незаполненный раздел или оформление — MAJOR, "
+                        "отдельный блокирующий эффект не установлен.")
+            n += 1
     return n

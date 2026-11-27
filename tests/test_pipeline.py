@@ -202,15 +202,20 @@ def _tmpdoc(text):
 
 
 def test_data_type_and_nfr_rules():
-    """Поле с разными типами в таблицах запроса и ответа; срок без перцентиля — универсальные правила."""
+    """R08: разные типы в запросе и ответе — не дефект; R09: схема ответа и пример того же ответа расходятся;
+    R07: точка отсчёта указана — не утверждаем, что её нет; срок без перцентиля — универсальные правила."""
     from reqreview.rules import check_document, check_requirement
     doc = _tmpdoc("\n".join([
         "# Заказ", "## Запрос", "| Поле | Тип | Описание |", "| --- | --- | --- |",
         "| `qty` | integer | Количество |", "| `note` | string | Комментарий |", "",
         "## Ответ", "| Name | Format |", "| :--- | :--- |", "| qty | string |", "| note | string |"]))
+    assert [h for h in check_document(doc) if h["tag"] == "DATA-TYPE"] == [], "R08: запрос ≠ ответ — не противоречие"
+    doc = _tmpdoc("\n".join([
+        "# Заказ", "## Ответ", "| Поле | Тип | Описание |", "| --- | --- | --- |",
+        "| `amount` | integer | Сумма |", "| `note` | string | Комментарий |", "",
+        "### 200 OK", "```json", '{"amount": "50000", "note": "ok"}', "```"]))
     hits = [h for h in check_document(doc) if h["tag"] == "DATA-TYPE"]
-    assert len(hits) == 1 and "«qty»" in hits[0]["problem"] and "note" not in hits[0]["problem"]
-    assert {g for g, _ in hits[0]["locs"]} == {5, 11}
+    assert len(hits) == 1 and "amount" in hits[0]["problem"] and "note" not in hits[0]["problem"], hits
     assert [h["tag"] for h in check_requirement("Отчёт формируется не более 3 секунд.")] == ["NFR-METRIC"]
     assert check_requirement("Отчёт формируется не более 3 секунд для 95% запросов.") == []
 
