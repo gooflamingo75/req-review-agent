@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -221,6 +222,17 @@ def _bump(r: Requirement, c: str, status: str):
         r.criteria[c] = status
 
 
+def parallel_map(fn, items: list) -> list:
+    """Выполняет независимые запросы к модели параллельно (PARALLEL_REQUESTS, по умолчанию 4) и возвращает
+    результаты в исходном порядке — отчёт от параллельности не зависит."""
+    n = max(1, int(os.getenv("PARALLEL_REQUESTS", "4") or 1))
+    if n == 1 or len(items) <= 1:
+        return [fn(x) for x in items]
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(n, len(items))) as ex:
+        return list(ex.map(fn, items))
+
+
 def review_requirements(doc: Document, reqs: list[Requirement], llm, batch_size: int, warnings: list[str],
                         cov: Coverage | None = None):
     full = doc.char_count() <= FULL_CONTEXT_CHARS
@@ -234,22 +246,30 @@ def review_requirements(doc: Document, reqs: list[Requirement], llm, batch_size:
     by_num = {re.sub(r"\D", "", r.id).lstrip("0"): r for r in reqs}
     batches = [reqs[i:i + batch_size] for i in range(0, len(reqs), batch_size)]
     is_mock = llm.model == "mock"
+    jobs = []
     for bi, batch in enumerate(batches, 1):
-        log(f"[2/5] Проверка требований: пакет {bi}/{len(batches)} ({batch[0].id}…{batch[-1].id})…")
         payload = [{"id": r.id, "doc_id": r.doc_id, "section": r.section, "kind": r.kind, "text": r.text,
                     "rule_hints": [f"«{h['trigger']}»: {h['problem']}" for h in hints[r.id] if h["trigger"]]}
                    for r in batch]
         recs = [cov.chunk(f"REV-{bi:02d}/{r.id}", "review", [doc.span(r.g1, r.g2)], [r.id]) for r in batch] if cov else []
         for rc in recs:
             cov.sent(rc, ctx_spans)
+        jobs.append((bi, batch, payload, recs))
+
+    def call(job):
+        bi, batch, payload, _ = job
+        log(f"[2/5] Проверка требований: пакет {bi}/{len(batches)} ({batch[0].id}…{batch[-1].id}) отправлен…")
         try:
-            data = llm.generate_json("review", prompts.SYSTEM,
-                                     prompts.review_prompt(doc.title, context, payload),
+            return llm.generate_json("review", prompts.SYSTEM, prompts.review_prompt(doc.title, context, payload),
                                      {"requirements": payload})
         except LLMError as e:
+            return e
+
+    for (bi, batch, payload, recs), data in zip(jobs, parallel_map(call, jobs)):
+        if isinstance(data, LLMError):
             for rc in recs:
-                cov.done(rc, False, str(e)[:200])
-            warnings.append(f"Пакет {batch[0].id}…{batch[-1].id} не проверен моделью: {e}. Применены только правила.")
+                cov.done(rc, False, str(data)[:200])
+            warnings.append(f"Пакет {batch[0].id}…{batch[-1].id} не проверен моделью: {data}. Применены только правила.")
             data = {"results": []}
         results = data.get("results", []) if isinstance(data, dict) else (data or [])
         for res in results:
@@ -385,28 +405,54 @@ def rule_matrix(reqs: list[Requirement]) -> tuple[list[dict], list[dict]]:
     return out, acc_out
 
 
-def review_set(doc: Document, reqs: list[Requirement], llm, warnings: list[str], cov: Coverage | None = None):
+SET_PASSES = [("consistency", "непротиворечивость, архитектура и стандарты"),
+              ("completeness", "полнота, пограничные сценарии, прослеживаемость")]
+
+
+def _set_context(doc: Document, reqs: list[Requirement]):
     if doc.char_count() <= SET_FULL_DOC_CHARS:
         doc_text = doc.numbered()
     else:
         doc_text = "(документ большой — приведена структура заголовков)\n" + doc.headings_outline()
     rl = [{"id": r.id, "doc_id": r.doc_id, "text": r.text, "g1": r.g1} for r in reqs]
-    by_id = {r.id: r for r in reqs}
     doc_rules = rules.check_document(doc)
     hints = [f"[{h['tag']}] {h['problem']} (строки: {', '.join('L' + str(g) for g, _ in h['locs'])})" for h in doc_rules]
+    return doc_text, rl, doc_rules, hints
+
+
+def set_passes(doc: Document, reqs: list[Requirement], llm) -> dict:
+    """Проходы 1 и 2 проверки набора не зависят от проверки отдельных требований — выполняются параллельно
+    с ней. Возвращает {проход: ответ модели или LLMError}."""
+    doc_text, rl, _, hints = _set_context(doc, reqs)
+
+    def call(item):
+        part, title = item
+        log(f"[3/5] Проверка набора требований ({title}) отправлена…")
+        try:
+            return llm.generate_json(f"set_{part}", prompts.SYSTEM,
+                                     prompts.set_prompt(part, doc.title, doc_text, rl, hints), {"requirements": rl})
+        except LLMError as e:
+            return e
+    return dict(zip([p for p, _ in SET_PASSES], parallel_map(call, SET_PASSES)))
+
+
+def review_set(doc: Document, reqs: list[Requirement], llm, warnings: list[str], cov: Coverage | None = None,
+               prefetched: dict | None = None):
+    doc_text, rl, doc_rules, hints = _set_context(doc, reqs)
+    by_id = {r.id: r for r in reqs}
     counters = {"dropped": 0, "bad_quotes": 0}
     findings: list[Finding] = []
     sc_raw: dict = {}
     edge_cases, trace = [], []
-    for step, (part, title) in enumerate([("consistency", "непротиворечивость, архитектура и стандарты"),
-                                          ("completeness", "полнота, пограничные сценарии, прослеживаемость")], 1):
-        log(f"[3/5] Проверка набора требований ({step}/3: {title})…")
-        try:
-            data = llm.generate_json(f"set_{part}", prompts.SYSTEM,
-                                     prompts.set_prompt(part, doc.title, doc_text, rl, hints), {"requirements": rl})
+    if prefetched is None:
+        prefetched = set_passes(doc, reqs, llm)
+    for step, (part, title) in enumerate(SET_PASSES, 1):
+        data = prefetched.get(part)
+        if not isinstance(data, LLMError):
             if cov:
                 cov.check(f"set_{part}", f"Набор: {title}", "выполнена")
-        except LLMError as e:
+        else:
+            e = data
             warnings.append(f"Проверка набора ({title}) моделью не выполнена: {e}. Применены только правила.")
             data = {}
             if cov:
@@ -602,8 +648,14 @@ def run(doc: Document, llm, batch_size: int = 8) -> Result:
     log(f"      найдено требований: {len(reqs)}")
     if not reqs:
         warnings.append("В документе не найдено ни одного требования.")
-    review_requirements(doc, reqs, llm, batch_size, warnings, cov)
-    set_findings, set_criteria, edge_cases, trace = review_set(doc, reqs, llm, warnings, cov)
+    # проходы 1–2 проверки набора идут фоном, пока проверяются отдельные требования
+    from concurrent.futures import ThreadPoolExecutor
+    parallel = int(os.getenv("PARALLEL_REQUESTS", "4") or 1) > 1
+    with ThreadPoolExecutor(max_workers=1) as bg:
+        fut = bg.submit(set_passes, doc, reqs, llm) if parallel else None
+        review_requirements(doc, reqs, llm, batch_size, warnings, cov)
+        pre = fut.result() if fut is not None else None
+    set_findings, set_criteria, edge_cases, trace = review_set(doc, reqs, llm, warnings, cov, prefetched=pre)
     cov.check("rules", "Автоматические проверки документа (без LLM)", "выполнена")
     acc = verify.acceptance_gaps(reqs, trace, Finding)
     if acc is not None:

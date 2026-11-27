@@ -39,18 +39,24 @@ def log(msg: str) -> None:
 
 
 # Порядок важен: сначала полноценные flash-модели, облегчённые «lite» — только в крайнем случае
-DEFAULT_GEMINI_FALLBACKS = ["gemini-3.6-flash", "gemini-flash-latest", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite",
-                            "gemini-flash-lite-latest"]
-OVERLOAD_RETRIES_PRIMARY = 4    # столько раз подряд ждём основную модель при перегрузке (503), прежде чем уйти на резерв
+DEFAULT_GEMINI_FALLBACKS = ["gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
+OVERLOAD_COOLDOWN_SEC = 60.0     # перегруженная (503) модель пропускается столько секунд, затем пробуем снова
+OVERLOAD_COOLDOWN_MAX = 300.0    # при повторных перегрузках пауза растёт до этого предела
+REQUEST_TIMEOUT_SEC = 240        # один запрос не может «висеть» дольше
 
 
 class GeminiLLM:
-    """Gemini с повторами и автоматическим переключением на резервные модели,
-    если основная перегружена (503), не найдена (404) или исчерпан её дневной лимит."""
+    """Gemini с быстрым переключением на резервные модели.
+
+    Перегрузка (503) у модели не пережидается длинными паузами: запрос сразу уходит на следующую модель,
+    а перегруженная модель пропускается следующими запросами в течение короткой паузы (cooldown), после чего
+    основная модель снова получает запросы первой. Недоступные модели (404, дневной лимит) выбывают до конца
+    прогона. Класс потокобезопасен: агент отправляет независимые запросы параллельно."""
 
     def __init__(self, api_key: str, model: str = "gemini-3.8-flash",
                  min_interval: float = 6.0, max_retries: int = 6, temperature: float = 0.1,
                  fallbacks: list[str] | None = None):
+        import threading
         try:
             from google import genai
             from google.genai import types
@@ -59,21 +65,27 @@ class GeminiLLM:
         if not api_key:
             raise LLMError("Не задан GEMINI_API_KEY. Скопируйте .env.example в .env и вставьте ключ.")
         self._types = types
-        self.client = genai.Client(api_key=api_key)
+        try:
+            self.client = genai.Client(api_key=api_key,
+                                       http_options=types.HttpOptions(timeout=REQUEST_TIMEOUT_SEC * 1000))
+        except Exception:  # noqa: BLE001 — старые версии SDK без HttpOptions
+            self.client = genai.Client(api_key=api_key)
         chain = [model] + list(DEFAULT_GEMINI_FALLBACKS if fallbacks is None else fallbacks)
         self.models = list(dict.fromkeys(m.strip() for m in chain if m and m.strip()))
-        self._idx = 0
-        self.dead: set[str] = set()          # модели, недоступные до конца прогона (404, дневной лимит)
+        self.dead: set[str] = set()                 # недоступны до конца прогона (404, дневной лимит)
+        self.cool: dict[str, float] = {}            # перегружена до момента времени (monotonic)
+        self.strikes: dict[str, int] = {}           # сколько раз подряд модель была перегружена
         self.min_interval = min_interval
         self.max_retries = max_retries
         self.temperature = temperature
-        self._last = 0.0
+        self._last: dict[str, float] = {}           # пауза между запросами — у каждой модели свой лимит
+        self._lock = threading.Lock()
         self.calls = 0
         self.used: dict[str, int] = {}
 
     @property
     def model(self) -> str:
-        return self.models[min(self._idx, len(self.models) - 1)]
+        return self.models[0]
 
     @property
     def name(self) -> str:
@@ -83,28 +95,6 @@ class GeminiLLM:
             return f"Google Gemini · {next(iter(self.used))}"
         return "Google Gemini · " + ", ".join(f"{m} ({n} запр.)" for m, n in self.used.items())
 
-    def _wait_turn(self):
-        dt = time.monotonic() - self._last
-        if dt < self.min_interval:
-            time.sleep(self.min_interval - dt)
-        self._last = time.monotonic()
-
-    def _switch(self, reason: str, permanent: bool = False) -> bool:
-        old = self.model
-        if permanent:
-            self.dead.add(old)
-        nxt = next((i for i in range(self._idx + 1, len(self.models)) if self.models[i] not in self.dead), None)
-        if nxt is None:
-            return False
-        self._idx = nxt
-        log(f"   ! модель {old} {reason} — {'переключаюсь' if permanent else 'для этого запроса использую'} "
-            f"резервную {self.model}")
-        return True
-
-    def _reset(self):
-        """Каждый новый запрос сначала пробует основную модель (если она не выбыла насовсем)."""
-        self._idx = next((i for i, m in enumerate(self.models) if m not in self.dead), len(self.models) - 1)
-
     @property
     def primary(self) -> str:
         return self.models[0]
@@ -113,6 +103,44 @@ class GeminiLLM:
         total = sum(self.used.values())
         return (self.used.get(self.primary, 0) / total) if total else None
 
+    def _pick(self, skip: set[str]) -> tuple[str | None, float]:
+        """Первая доступная модель по приоритету. Если все живые модели «остывают» — та, что освободится
+        раньше всех, и сколько её ждать."""
+        now = time.monotonic()
+        with self._lock:
+            alive = [m for m in self.models if m not in self.dead and m not in skip]
+            if not alive:
+                return None, 0.0
+            for m in alive:
+                if self.cool.get(m, 0) <= now:
+                    return m, 0.0
+            m = min(alive, key=lambda x: self.cool.get(x, 0))
+            return m, self.cool[m] - now
+
+    def _wait_turn(self, model: str):
+        with self._lock:
+            now = time.monotonic()
+            start = max(now, self._last.get(model, 0) + self.min_interval)
+            self._last[model] = start
+        if start > now:
+            time.sleep(start - now)
+
+    def _overloaded(self, model: str, code) -> None:
+        with self._lock:
+            n = self.strikes.get(model, 0) + 1
+            self.strikes[model] = n
+            pause = min(OVERLOAD_COOLDOWN_SEC * (2 ** (n - 1)), OVERLOAD_COOLDOWN_MAX)
+            self.cool[model] = time.monotonic() + pause
+        log(f"   ! {model} перегружена ({code}) — запрос сразу ушёл на резервную модель; "
+            f"{model} пропускается {pause:.0f} с")
+
+    def _kill(self, model: str, reason: str) -> None:
+        with self._lock:
+            new = model not in self.dead
+            self.dead.add(model)
+        if new:
+            log(f"   ! модель {model} {reason} — исключена до конца прогона")
+
     def _raw(self, system: str, prompt: str) -> str:
         types = self._types
         cfg = types.GenerateContentConfig(
@@ -120,18 +148,33 @@ class GeminiLLM:
             temperature=self.temperature,
             response_mime_type="application/json",
         )
-        self._reset()
-        delay, attempt, overloaded, last_err = 10.0, 0, 0, ""
+        attempt, last_err, rate_wait = 0, "", 5.0
+        skip: set[str] = set()                     # модели, уже отказавшие в ЭТОМ запросе
         while attempt < self.max_retries * 3:
+            model, wait = self._pick(skip)
+            if model is None:
+                # все модели отказали в этом запросе — короткая пауза и новый круг с основной модели
+                skip.clear()
+                model, wait = self._pick(skip)
+                if model is None:
+                    raise LLMError(f"Ни одна из моделей {', '.join(self.models)} не доступна. {last_err}")
+                wait = max(wait, 5.0)
+            if wait > 0:
+                wait = min(wait, 30.0)
+                log(f"   ! все модели перегружены, жду {wait:.0f} с…")
+                time.sleep(wait)
             attempt += 1
-            self._wait_turn()
+            self._wait_turn(model)
             try:
-                resp = self.client.models.generate_content(model=self.model, contents=prompt, config=cfg)
-                self.calls += 1
+                resp = self.client.models.generate_content(model=model, contents=prompt, config=cfg)
+                with self._lock:
+                    self.calls += 1
                 text = resp.text
                 if not text:
                     raise LLMError("пустой ответ модели")
-                self.used[self.model] = self.used.get(self.model, 0) + 1
+                with self._lock:
+                    self.used[model] = self.used.get(model, 0) + 1
+                    self.strikes[model] = 0
                 return text
             except Exception as e:  # noqa: BLE001
                 code = getattr(e, "code", None) or getattr(e, "status_code", None)
@@ -140,32 +183,24 @@ class GeminiLLM:
                 if code in (401, 403) or "API_KEY_INVALID" in msg or "PERMISSION_DENIED" in msg:
                     raise LLMError(f"Ключ отклонён ({code}). Проверьте GEMINI_API_KEY в .env. {msg[:300]}") from e
                 if code == 404 or (code == 400 and "model" in msg.lower() and "not" in msg.lower()):
-                    if self._switch("недоступна (404)", permanent=True):
-                        overloaded = 0
-                        continue
-                    raise LLMError(f"Ни одна из моделей {', '.join(self.models)} не доступна. {msg[:200]}") from e
+                    self._kill(model, "недоступна (404)")
+                    continue
                 if code == 400:
                     raise LLMError(f"Запрос отклонён (400): {msg[:300]}") from e
                 if code == 429 and "PerDay" in msg:
-                    if self._switch("исчерпала дневной лимит бесплатного тарифа", permanent=True):
-                        overloaded = 0
-                        continue
-                    raise LLMError("Исчерпан дневной лимит бесплатного тарифа Gemini на всех моделях. "
-                                   "Попробуйте позже.") from e
-                if code in (500, 502, 503, 504) or isinstance(e, LLMError):
-                    overloaded += 1
-                    limit = OVERLOAD_RETRIES_PRIMARY if self._idx == 0 else 2
-                    if overloaded >= limit and self._switch(f"перегружена ({code})"):
-                        overloaded = 0
-                        delay = 10.0
-                        continue
-                wait = delay
-                m = re.search(r"retry(?:Delay)?['\"]?\s*[:=]?\s*['\"]?(\d+(?:\.\d+)?)s", msg, re.I)
-                if m:
-                    wait = max(wait, float(m.group(1)) + 1)
-                log(f"   ! ошибка API ({code or type(e).__name__}) у {self.model}, попытка {attempt}, жду {wait:.0f} с…")
-                time.sleep(wait)
-                delay = min(delay * 2, 60)
+                    self._kill(model, "исчерпала дневной лимит бесплатного тарифа")
+                    continue
+                if code == 429:
+                    # поминутный лимит: ждём, сколько просит сервис, но не дольше 60 с
+                    m = re.search(r"retry(?:Delay)?['\"]?\s*[:=]?\s*['\"]?(\d+(?:\.\d+)?)s", msg, re.I)
+                    w = min(float(m.group(1)) + 1, 60.0) if m else rate_wait
+                    rate_wait = min(rate_wait * 2, 60.0)
+                    log(f"   ! лимит запросов в минуту у {model} (429), жду {w:.0f} с…")
+                    time.sleep(w)
+                    continue
+                # 5xx, тайм-аут, обрыв соединения, пустой ответ — сразу пробуем следующую модель
+                self._overloaded(model, code or type(e).__name__)
+                skip.add(model)
         raise LLMError(f"Не удалось получить ответ после {attempt} попыток: {last_err}")
 
     def generate_json(self, task: str, system: str, prompt: str, payload: Any = None) -> Any:

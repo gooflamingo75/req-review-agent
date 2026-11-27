@@ -266,6 +266,44 @@ def test_fix_references_and_marks():
     assert r.criteria == {"CON": "fail", "COM": "warn"}
 
 
+def test_gemini_fast_failover():
+    """503 у основной модели: запрос сразу уходит на резервную (без длинных пауз), основная пропускается
+    на время cooldown; 404 исключает модель; параллельные запросы безопасны."""
+    import threading
+    import time as _t
+    from concurrent.futures import ThreadPoolExecutor
+    from reqreview import llm as L
+
+    class Err(Exception):
+        def __init__(self, code):
+            super().__init__(f"err {code}")
+            self.code = code
+
+    class Models:
+        def __init__(self):
+            self.log, self.lock = [], threading.Lock()
+
+        def generate_content(self, model, contents, config):
+            with self.lock:
+                self.log.append(model)
+            if model == "main":
+                raise Err(503)
+            if model == "gone":
+                raise Err(404)
+            return type("R", (), {"text": '{"ok": 1}'})()
+
+    g = L.GeminiLLM("k", model="main", min_interval=0.0, fallbacks=["gone", "backup"])
+    g.client = type("C", (), {"models": Models()})()
+    t0 = _t.monotonic()
+    with ThreadPoolExecutor(4) as ex:
+        out = list(ex.map(lambda _: g.generate_json("t", "s", "p"), range(6)))
+    assert all(o == {"ok": 1} for o in out)
+    assert _t.monotonic() - t0 < 3, "перегрузка не должна вызывать длинных пауз"
+    assert "gone" in g.dead and g.used == {"backup": 6}
+    assert g.client.models.log.count("main") <= 4, "перегруженная основная модель пропускается"
+    assert g.primary_share() == 0
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
