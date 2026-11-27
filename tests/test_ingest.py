@@ -172,6 +172,7 @@ def test_full_report_pdf_and_links():
         text = "".join(p.get_text() for p in d)
         assert "Вердикт" in d[0].get_text() and "Исходный текст" in text and "₸" in text
         assert "1. Паспорт прогона" in d[1].get_text(), "после обложки — разделы шаблона"
+        assert "MOG DEPARTMENT" in d[0].get_text() and "Mog department" in d[1].get_text()
         links = [lk for p in d for lk in p.get_links() if lk.get("kind") == pymupdf.LINK_GOTO]
         assert links and all(0 <= lk["page"] < d.page_count for lk in links)
         assert d.get_toc()

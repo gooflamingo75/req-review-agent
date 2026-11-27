@@ -347,7 +347,7 @@ def write_pdf_html(body: str, out_path: Path, css: str, footer: str = "") -> Pat
             pdf.set_toc(clean)
         except Exception:  # noqa: BLE001
             pdf.set_toc([c[:3] for c in clean])
-    pdf.set_metadata({"title": "Отчёт о статической проверке требований", "creator": "req-review-agent",
+    pdf.set_metadata({"title": "Отчёт о статической проверке требований", "creator": "req-review-agent", "author": "Mog department",
                       "producer": "PyMuPDF"})
     out_path.parent.mkdir(parents=True, exist_ok=True)
     pdf.save(str(out_path), garbage=3, deflate=True)

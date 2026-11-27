@@ -461,12 +461,13 @@ def _title(v: View, o: Out, kind: str):
     doc = v.d.get("document") or {}
     date = (v.d.get("date") or "")[:16].replace("T", " ")
     title = doc.get("title") or doc.get("file") or ""
-    o.html(f'<div class="band"><p class="eyebrow">{html.escape(kind.upper())}</p>'
+    from . import __team__
+    o.html(f'<div class="band"><p class="eyebrow">{html.escape(kind.upper())} · {html.escape(__team__.upper())}</p>'
            f'<h1 id="top">{html.escape(title)}</h1>'
            f'<p class="sub">{html.escape(doc.get("file", ""))} · {html.escape(date)} · '
            f'{html.escape(v.d.get("model", ""))} · агент {html.escape(v.d.get("agent_version", ""))}</p></div>',
            f"# {kind}: «{title}»\n\n*{doc.get('file', '')} · {date} · {v.d.get('model', '')} · "
-           f"агент {v.d.get('agent_version', '')}*\n")
+           f"агент {v.d.get('agent_version', '')} · команда {__team__}*\n")
 
 
 def _headline(v: View) -> tuple[str, str]:
@@ -678,6 +679,11 @@ def _dropped_count(v: View) -> int:
     return 0
 
 
+def _team() -> str:
+    from . import __team__
+    return f"{__team__} (req-review-agent)"
+
+
 def _model_line(v: View) -> str:
     st = v.d.get("stats") or {}
     used = st.get("model_usage") or {}
@@ -700,6 +706,7 @@ def _passport(v: View, o: Out):
           ("Дата и время прогона", (v.d.get("date") or "").replace("T", " ")),
           ("Модель", _model_line(v)),
           ("Версия агента", v.d.get("agent_version", "—")),
+          ("Команда", _team()),
           ("Время анализа", f"{v.d.get('duration_sec', 0):.0f} сек"),
           ("SHA-256 документа", f"`{doc.get('sha256', '')}`"),
           ("Стандарты", "ISO/IEC/IEEE 29148:2018 п. 5.2.5, 5.2.6; IEEE Std 830-1998 п. 4.3; руководство "

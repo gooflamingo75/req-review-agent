@@ -9,6 +9,7 @@ import datetime as dt
 import json
 from pathlib import Path
 
+from . import __team__
 from .agent import Finding, Result
 from .coverage import STATUS_RU as RUN_STATUS_RU
 from .criteria import SEVERITY
@@ -35,7 +36,7 @@ def to_json(res: Result, agent_version: str) -> str:
                 "lines": [list(x) for x in (f.locs or ([(f.g1, f.g2)] if f.g1 is not None else []))]}
     data = {
         "document": {"title": res.doc.title, "file": res.doc.path.name, "sha256": res.doc.sha256},
-        "model": res.model_name, "agent_version": agent_version,
+        "model": res.model_name, "agent_version": agent_version, "team": __team__,
         "date": dt.datetime.fromtimestamp(res.finished).astimezone().isoformat(timespec="seconds"),
         "duration_sec": round(res.finished - res.started, 1),
         "stats": res.stats,
@@ -89,7 +90,8 @@ def _pdf(data: dict, pdf_path: Path, doc, agent_version: str) -> tuple[Path | No
     try:
         from . import present
         from .pdf import validate_pdf
-        present.write_pdf(data, doc, pdf_path, footer=f"req-review-agent {agent_version}")
+        from . import __team__
+        present.write_pdf(data, doc, pdf_path, footer=f"req-review-agent {agent_version} · {__team__}")
         v = validate_pdf(pdf_path)
         if not v["ok"]:
             return None, f"PDF создан, но не прошёл проверку: {v}"
