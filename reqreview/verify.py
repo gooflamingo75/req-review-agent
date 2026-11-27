@@ -353,7 +353,13 @@ def explain_critical(doc, reqs, set_findings, llm, doc_text: str, prompts_mod, w
             f.caveat = "Критичность понижена до MAJOR: последствия не подтвердились при обосновании. " + \
                        collapse_ws(str(x.get("severity_reason") or ""))
             continue
+        for k in ("decision", "impact", "owner"):
+            why[k] = collapse_ws(str(x.get(k) or ""))
+        opts = x.get("options") if isinstance(x.get("options"), list) else []
         f.why = {k: v for k, v in why.items() if v}
+        opts = [collapse_ws(str(o)) for o in opts if collapse_ws(str(o))][:3]
+        if len(opts) >= 2:
+            f.why["options"] = opts
         got += 1
     if cov:
         cov.check("why", title, "выполнена" if got or not crit else "не выполнена",

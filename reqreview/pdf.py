@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import html
+import io
 import re
 from pathlib import Path
 
@@ -229,25 +230,61 @@ def write_pdf(md: str, out_path: Path, doc=None, source_title: str = "", footer:
     return write_pdf_html(body, out_path, CSS, footer)
 
 
+PAGEBREAK = "<!--PAGEBREAK-->"
+
+
 def write_pdf_html(body: str, out_path: Path, css: str, footer: str = "") -> Path:
     import pymupdf
 
     out_path = Path(out_path)
-    story = pymupdf.Story(html=f"<body>{body}</body>", user_css=css)
     page = pymupdf.paper_rect("a4")
     content = page + (42, 40, -42, -46)
     toc: list[list] = []
     titles = {m.group(2): html.unescape(re.sub(r"<[^>]+>", "", m.group(3)))
               for m in re.finditer(r'<h(\d) id="([^"]+)">(.*?)</h\1>', body, re.S)}
+    # Разрывы страниц: CSS page-break в MuPDF Story может зацикливаться, поэтому каждый фрагмент между
+    # метками PAGEBREAK — отдельный Story в одном документе (всегда с новой страницы); внутренние ссылки
+    # между фрагментами расставляются по собранным позициям элементов.
+    parts = [p_ for p_ in body.split(PAGEBREAK) if p_.strip()]
+    stream = io.BytesIO()
+    writer = pymupdf.DocumentWriter(stream)
+    positions: list[tuple] = []           # (id, href, page_index, rect)
+    offset = 0
+    for part in parts:
+        story = pymupdf.Story(html=f"<body>{part}</body>", user_css=css)
+        used = [0]
 
-    def rectfn(rect_num, filled):
-        return page, content, None
+        def rectfn(rect_num, filled, used=used):
+            used[0] = max(used[0], rect_num + 1)
+            return page, content, None
 
-    def positionfn(pos):
-        if pos.heading and (pos.open_close & 1) and pos.heading <= 3:
-            toc.append([pos.heading, titles.get(pos.id) or pos.text.strip(), pos.page_num, pos.rect])
-
-    pdf = story.write_with_links(rectfn, positionfn=positionfn)
+        def positionfn(pos, off=offset):
+            if not (pos.open_close & 1):
+                return
+            pg = off + pos.page_num - 1
+            positions.append((pos.id, pos.href, pg, tuple(pos.rect)))
+            if pos.heading and pos.heading <= 3:
+                toc.append([pos.heading, titles.get(pos.id) or pos.text.strip(), pg + 1, pos.rect])
+        story.write(writer, rectfn, positionfn=positionfn)
+        offset += used[0]
+    writer.close()
+    stream.seek(0)
+    pdf = pymupdf.open("pdf", stream)
+    targets: dict[str, tuple] = {}
+    for pid, _, pg, rect in positions:
+        if pid and pid not in targets:
+            targets[pid] = (pg, rect)
+    for _, href, pg, rect in positions:
+        if not href or pg >= pdf.page_count:
+            continue
+        if href.startswith("#"):
+            t = targets.get(href[1:])
+            if t is None or t[0] >= pdf.page_count:
+                continue
+            pdf[pg].insert_link({"kind": pymupdf.LINK_GOTO, "from": pymupdf.Rect(rect), "page": t[0],
+                                 "to": pymupdf.Point(t[1][0], t[1][1])})
+        else:
+            pdf[pg].insert_link({"kind": pymupdf.LINK_URI, "from": pymupdf.Rect(rect), "uri": href})
     n = pdf.page_count
     for pno in range(n):
         pg = pdf[pno]

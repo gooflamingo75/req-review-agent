@@ -778,8 +778,11 @@ def _pdf(data: dict, pdf_path: Path, doc, agent_version: str) -> tuple[Path | No
         return None, f"PDF не создан: {type(e).__name__}: {e}"
 
 
-def write(res: Result, out_path: str | Path, agent_version: str, input_display: str) -> dict:
+def write(res: Result, out_path: str | Path, agent_version: str, input_display: str, compare_with=None) -> dict:
     data = json.loads(to_json(res, agent_version))
+    if compare_with:
+        from .compare import compare
+        data["comparison"] = compare(compare_with, data)
     return write_data(data, res.doc, out_path, agent_version)
 
 

@@ -68,6 +68,8 @@ def main(argv=None) -> int:
     p.add_argument("--mock", action="store_true", help="демо-режим без ключа и без LLM (только правила) — для проверки установки")
     p.add_argument("--from-json", dest="from_json", help="перестроить отчёт (PDF/MD) из сохранённого report.json без "
                    "обращения к модели; input — тот же документ (для приложения «Исходный текст»)")
+    p.add_argument("--compare", dest="compare", help="сравнить с предыдущим прогоном (путь к его .json): "
+                   "в отчёте появится блок «Что изменилось» — закрытые, новые и оставшиеся дефекты")
     a = p.parse_args(argv)
     a.input = a.input_opt or a.input
     a.output = a.output_opt or a.output or "reports/report.md"
@@ -111,6 +113,9 @@ def main(argv=None) -> int:
             print("ОШИБКА: документ отличается от того, по которому создан JSON (SHA-256 не совпадает).", file=sys.stderr)
             return 2
         data["render"] = {"rerendered_by": version}
+        if a.compare:
+            from reqreview.compare import compare
+            data["comparison"] = compare(_json.loads(Path(a.compare).read_text(encoding="utf-8")), data)
         files = write_data(data, doc, a.output, version)
         report_files(files, f"Отчёт перестроен из {a.from_json} (модель не вызывалась):")
         return 0 if files.get("pdf") else 4
@@ -165,7 +170,14 @@ def main(argv=None) -> int:
         print("\nОстановлено пользователем.", file=sys.stderr)
         return 130
 
-    files = write(result, a.output, version, shown)
+    prev = None
+    if a.compare:
+        import json as _json
+        try:
+            prev = _json.loads(Path(a.compare).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            print(f"  ⚠ сравнение пропущено: не удалось прочитать {a.compare}: {e}", file=sys.stderr)
+    files = write(result, a.output, version, shown, compare_with=prev)
     s = result.stats
     from reqreview.coverage import STATUS_RU
     report_files(files, f"Готово! Статус проверки: {STATUS_RU[result.status]}"

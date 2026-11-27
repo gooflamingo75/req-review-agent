@@ -170,12 +170,17 @@ def test_full_report_pdf_and_links():
     import pymupdf
     with pymupdf.open(str(files["pdf"])) as d:
         text = "".join(p.get_text() for p in d)
-        assert "Резюме для руководителя" in text and "Исходный текст" in text and "₸" in text
+        assert "Вердикт" in d[0].get_text() and "Исходный текст" in text and "₸" in text
+        assert "План исправлений по ролям" in d[1].get_text() or "План исправлений по ролям" in d[2].get_text()
         links = [lk for p in d for lk in p.get_links() if lk.get("kind") == pymupdf.LINK_GOTO]
         assert links and all(0 <= lk["page"] < d.page_count for lk in links)
         assert d.get_toc()
     md = files["md"].read_text(encoding="utf-8")
-    assert md.index("Резюме для руководителя") < md.index("## 1. Паспорт прогона") < md.index("## 6. Итоговый")
+    order = ["## Вердикт", "План исправлений по ролям", "## Вопросы к аналитику и тест-кейсы", "# Приложения",
+             "Приложение А. Паспорт", "Приложение В. Детальная", "Приложение Е. Полная матрица",
+             "Приложение Ж. Критерии и методика", "Приложение К. Исходный текст"]
+    pos = [md.index(x) for x in order]
+    assert pos == sorted(pos), list(zip(order, pos))
     # каждая строка исходного файла есть в приложении
     assert md.count("\nL0") >= len(doc.lines)
     # требования без замечаний не получают отдельной карточки
@@ -196,6 +201,27 @@ def test_rerender_from_json():
     f2 = write_data(data, load_document(SAMPLE), TMP / "b.md", "test")
     assert f1["md"].read_text(encoding="utf-8") == f2["md"].read_text(encoding="utf-8")
     assert f2["pdf"] and f2["pdf"].exists()
+
+
+def test_compare_runs():
+    """Повторный прогон после исправления: закрытые, новые и оставшиеся дефекты; блок на первой странице."""
+    import json
+    from reqreview.compare import compare
+    from reqreview.report import write_data
+    doc = load_document(SAMPLE)
+    res = run(doc, MockLLM(), batch_size=8)
+    f1 = write(res, TMP / "before.md", "test", "sample.md")
+    old = json.loads(f1["json"].read_text(encoding="utf-8"))
+    new = json.loads(json.dumps(old))
+    gone = new["set_findings"].pop(0)
+    c = compare(old, new)
+    assert [x["id"] for x in c["resolved"]] == [gone["id"]] and not c["new"]
+    assert c["same_document"] and len(c["still_open"]) == len(old["set_findings"]) - 1 + sum(
+        len(r["findings"]) for r in old["requirements"])
+    new["comparison"] = c
+    f2 = write_data(new, doc, TMP / "after.md", "test")
+    md = f2["md"].read_text(encoding="utf-8")
+    assert "Сравнение с прогоном" in md.split("План исправлений")[0] and "Что изменилось с прошлого прогона" in md
 
 
 def test_ocr_uncertain_token_not_critical():
