@@ -241,8 +241,8 @@ def to_html(o: Out) -> str:
             head, rows, widths, cls = b[1:]
             w = widths or [None] * len(head)
             t = [f'<table class="{cls}"><tr>'
-                 + "".join(f'<th{f" width=\"{x}%\"" if x else ""}{" class=l" if cls == "mx" and i == 0 else ""}>'
-                           f'{_inline_html(h)}</th>' for i, (h, x) in enumerate(zip(head, w))) + "</tr>"]
+                 + "".join("<th" + (f' width="{x}%"' if x else "") + (" class=l" if cls == "mx" and i == 0 else "")
+                           + f">{_inline_html(h)}</th>" for i, (h, x) in enumerate(zip(head, w))) + "</tr>"]
             for r in rows:
                 t.append("<tr>" + "".join(f'<td{" class=l" if cls == "mx" and i == 0 else ""}>{_cell_html(c)}</td>'
                                           for i, c in enumerate(r)) + "</tr>")
